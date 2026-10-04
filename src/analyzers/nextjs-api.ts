@@ -1,6 +1,6 @@
-import { relative } from "node:path";
-import { glob } from "glob";
-import { Node, Project, type SourceFile } from "ts-morph";
+import { Node, type SourceFile } from "ts-morph";
+import type { ScanContext } from "../core/scan-context.js";
+import { fromRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue } from "../types.js";
 
 const HTTP_METHODS = new Set([
@@ -65,13 +65,9 @@ function pagesRoutePath(filePath: string): string {
 
 function appRouterEndpoints(
   sourceFile: SourceFile,
-  projectPath: string,
+  file: string,
 ): NextEndpoint[] {
   const endpoints: NextEndpoint[] = [];
-  const file = relative(projectPath, sourceFile.getFilePath()).replace(
-    /\\/g,
-    "/",
-  );
   const path = appRoutePath(sourceFile.getFilePath());
 
   for (const declaration of sourceFile.getFunctions()) {
@@ -109,12 +105,8 @@ function appRouterEndpoints(
 
 function pagesRouterEndpoints(
   sourceFile: SourceFile,
-  projectPath: string,
+  file: string,
 ): NextEndpoint[] {
-  const file = relative(projectPath, sourceFile.getFilePath()).replace(
-    /\\/g,
-    "/",
-  );
   const methods = new Set<string>();
 
   for (const literal of sourceFile
@@ -140,45 +132,33 @@ function hasMarker(source: string, marker: RegExp): boolean {
 }
 
 export async function analyzeNextjsApi(
-  projectPath: string,
-  ignore: string[] = ["node_modules/**", ".next/**"],
+  context: ScanContext,
 ): Promise<AnalyzerResult | null> {
-  const routeFiles = await glob(
+  const routeFiles = context.matchFiles(
     [
       "{app,src/app}/**/route.{ts,tsx,js,mjs,cjs}",
       "{pages,src/pages}/api/**/*.{ts,tsx,js,mjs,cjs}",
     ],
     {
-      cwd: projectPath,
-      ignore: [
-        ...ignore,
+      exclude: [
         "**/*.test.{ts,tsx,js,mjs,cjs}",
         "**/*.spec.{ts,tsx,js,mjs,cjs}",
       ],
-      absolute: true,
     },
   );
 
   if (routeFiles.length === 0) return null;
 
-  const project = new Project({
-    compilerOptions: { allowJs: true, checkJs: false },
-    skipAddingFilesFromTsConfig: true,
-  });
   const endpoints: NextEndpoint[] = [];
 
   for (const routeFile of routeFiles) {
-    let sourceFile: SourceFile;
-    try {
-      sourceFile = project.addSourceFileAtPath(routeFile);
-    } catch {
-      continue;
-    }
+    const sourceFile = context.getSourceFile(routeFile);
+    if (!sourceFile) continue;
 
-    if (/(?:^|[\\/])pages[\\/]api[\\/]/.test(routeFile)) {
-      endpoints.push(...pagesRouterEndpoints(sourceFile, projectPath));
+    if (/(?:^|\/)pages\/api\//.test(routeFile)) {
+      endpoints.push(...pagesRouterEndpoints(sourceFile, routeFile));
     } else {
-      endpoints.push(...appRouterEndpoints(sourceFile, projectPath));
+      endpoints.push(...appRouterEndpoints(sourceFile, routeFile));
     }
   }
 
@@ -188,8 +168,7 @@ export async function analyzeNextjsApi(
       score: 0,
       issues: [
         {
-          severity: "critical",
-          rule: "no-nextjs-handlers",
+          ...fromRule("no-nextjs-handlers"),
           message: "Next.js API route files contain no detectable handlers",
         },
       ],
@@ -197,22 +176,9 @@ export async function analyzeNextjsApi(
     };
   }
 
-  const middlewareFiles = await glob(
-    ["middleware.{ts,js}", "src/middleware.{ts,js}"],
-    {
-      cwd: projectPath,
-      ignore,
-      absolute: true,
-    },
-  );
-  const middlewareSource = middlewareFiles
-    .map((file) => {
-      try {
-        return project.addSourceFileAtPath(file).getFullText();
-      } catch {
-        return "";
-      }
-    })
+  const middlewareSource = context
+    .matchFiles(["middleware.{ts,js}", "src/middleware.{ts,js}"])
+    .map((file) => context.getSourceFile(file)?.getFullText() ?? "")
     .join("\n");
   const hasGlobalAuth = hasMarker(middlewareSource, AUTH_MARKERS);
 
@@ -227,8 +193,7 @@ export async function analyzeNextjsApi(
   for (const endpoint of mutatingEndpoints) {
     if (!hasGlobalAuth && !hasMarker(endpoint.source, AUTH_MARKERS)) {
       issues.push({
-        severity: "warning",
-        rule: "missing-auth-check",
+        ...fromRule("missing-auth-check"),
         message: `${endpoint.method} ${endpoint.path} has no recognizable auth check`,
         file: endpoint.file,
         line: endpoint.line,
@@ -240,8 +205,7 @@ export async function analyzeNextjsApi(
   for (const endpoint of bodyEndpoints) {
     if (!hasMarker(endpoint.source, VALIDATION_MARKERS)) {
       issues.push({
-        severity: "warning",
-        rule: "missing-request-validation",
+        ...fromRule("missing-request-validation"),
         message: `${endpoint.method} ${endpoint.path} has no recognizable request validation`,
         file: endpoint.file,
         line: endpoint.line,
@@ -255,8 +219,7 @@ export async function analyzeNextjsApi(
   );
   for (const endpoint of broadPagesHandlers) {
     issues.push({
-      severity: "info",
-      rule: "implicit-pages-methods",
+      ...fromRule("implicit-pages-methods"),
       message: `${endpoint.path} does not expose explicit HTTP method branches`,
       file: endpoint.file,
       fix: "Reject unsupported request methods explicitly",
@@ -270,8 +233,7 @@ export async function analyzeNextjsApi(
   );
   if (!hasHealthEndpoint) {
     issues.push({
-      severity: "info",
-      rule: "missing-health-endpoint",
+      ...fromRule("missing-health-endpoint"),
       message: "No API health, readiness, or liveness route detected",
       fix: "Add a lightweight route for runtime monitoring",
     });

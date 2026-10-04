@@ -47,6 +47,34 @@
     "timestamp": {
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "skipped": {
+      "$ref": "#/$defs/skippedSummary"
+    },
+    "scoringVersion": {
+      "type": "integer",
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "matched",
+        "fixed"
+      ],
+      "properties": {
+        "matched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fixed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   },
   "$defs": {
@@ -137,6 +165,12 @@
         },
         "summary": {
           "type": "string"
+        },
+        "scoreBreakdown": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scoreBreakdownEntry"
+          }
         }
       }
     },
@@ -176,6 +210,121 @@
         "fix": {
           "type": "string",
           "minLength": 1
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "causedBy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "suppression": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "justification"
+          ],
+          "properties": {
+            "kind": {
+              "const": "inSource"
+            },
+            "justification": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "baseline": {
+          "type": "boolean"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        }
+      }
+    },
+    "skippedSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total",
+        "tooLarge",
+        "minified",
+        "unreadable",
+        "files"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tooLarge": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minified": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unreadable": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "file",
+              "reason"
+            ],
+            "properties": {
+              "file": {
+                "type": "string",
+                "minLength": 1
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "too-large",
+                  "minified",
+                  "unreadable"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "scoreBreakdownEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "count",
+        "penalty"
+      ],
+      "properties": {
+        "rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "penalty": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
         }
       }
     }

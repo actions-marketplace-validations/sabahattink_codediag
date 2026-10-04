@@ -1,4 +1,6 @@
 import chalk from "chalk";
+import { activeIssues, inactiveCounts } from "../core/issues.js";
+import { formatPenalty } from "../core/scoring.js";
 import type { ScanResult } from "../types.js";
 
 function scoreBar(score: number, width = 20): string {
@@ -80,20 +82,34 @@ export function renderTerminal(
     console.log(
       `  ${chalk.dim(a.name.padEnd(16))} ${bar} ${chalk.bold(scoreStr)}`,
     );
+    if (options.verbose) {
+      for (const entry of a.scoreBreakdown ?? []) {
+        console.log(
+          chalk.dim(
+            `    ${formatPenalty(entry.penalty).padStart(6)}  ${entry.rule} ×${entry.count}`,
+          ),
+        );
+      }
+    }
   }
   console.log();
 
   // Issues
   const criticals = result.analyzers.flatMap((a) =>
-    a.issues.filter((i) => i.severity === "critical"),
+    activeIssues(a).filter((i) => i.severity === "critical"),
   );
   const warnings = result.analyzers.flatMap((a) =>
-    a.issues.filter((i) => i.severity === "warning"),
+    activeIssues(a).filter((i) => i.severity === "warning"),
   );
   const infos = result.analyzers.flatMap((a) =>
-    a.issues.filter((i) => i.severity === "info"),
+    activeIssues(a).filter((i) => i.severity === "info"),
   );
   const total = criticals.length + warnings.length + infos.length;
+  const inactive = inactiveCounts(result.analyzers);
+  const notCounted = [
+    inactive.suppressed > 0 ? `${inactive.suppressed} suppressed` : "",
+    inactive.baseline > 0 ? `${inactive.baseline} in baseline` : "",
+  ].filter(Boolean);
 
   if (total > 0) {
     const parts: string[] = [];
@@ -102,6 +118,7 @@ export function renderTerminal(
     if (warnings.length > 0)
       parts.push(chalk.yellow(`${warnings.length} warnings`));
     if (infos.length > 0) parts.push(chalk.blue(`${infos.length} info`));
+    for (const label of notCounted) parts.push(chalk.dim(label));
     console.log(`  ${parts.join(chalk.dim(" \u00B7 "))}`);
     console.log();
 
@@ -110,8 +127,18 @@ export function renderTerminal(
       : [...criticals, ...warnings].slice(0, 10);
 
     for (const issue of showIssues) {
-      console.log(`  ${severityIcon(issue.severity)} ${issue.message}`);
-      if (issue.file) console.log(chalk.dim(`    ${issue.file}`));
+      const cause = issue.causedBy
+        ? chalk.dim(` (caused by ${issue.causedBy})`)
+        : "";
+      console.log(
+        `  ${severityIcon(issue.severity)} ${issue.message}${cause} ${chalk.dim(`[${issue.rule}]`)}`,
+      );
+      if (issue.file) {
+        const location = issue.line
+          ? `${issue.file}:${issue.line}`
+          : issue.file;
+        console.log(chalk.dim(`    ${location}`));
+      }
       if (issue.fix) console.log(chalk.dim(`    \u2192 ${issue.fix}`));
     }
 
@@ -127,6 +154,9 @@ export function renderTerminal(
     console.log();
   } else {
     console.log(chalk.green("  \u2714 No issues found. Ship it!"));
+    if (notCounted.length > 0) {
+      console.log(chalk.dim(`  ${notCounted.join(" \u00B7 ")}`));
+    }
     console.log();
   }
 }

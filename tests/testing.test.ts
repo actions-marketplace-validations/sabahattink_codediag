@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { analyzeTesting } from "../src/analyzers/testing.js";
+import { createScanContext } from "../src/core/scan-context.js";
 
 function createProject(): string {
   const directory = mkdtempSync(join(tmpdir(), "codediag-testing-"));
@@ -62,7 +63,7 @@ test("testing analyzer scores a real coverage summary", async () => {
       branches: 76,
     });
 
-    const result = await analyzeTesting(directory);
+    const result = await analyzeTesting(createScanContext(directory));
 
     assert.match(result.summary, /coverage: 84%/);
     assert.equal(
@@ -85,7 +86,7 @@ test("testing analyzer reports low coverage metrics", async () => {
       branches: 60,
     });
 
-    const result = await analyzeTesting(directory);
+    const result = await analyzeTesting(createScanContext(directory));
     const issue = result.issues.find(
       (candidate) => candidate.rule === "coverage-below-threshold",
     );
@@ -109,7 +110,7 @@ test("testing analyzer reports malformed coverage without crashing", async () =>
       JSON.stringify({ total: { lines: { pct: "unknown" } } }),
     );
 
-    const result = await analyzeTesting(directory);
+    const result = await analyzeTesting(createScanContext(directory));
 
     assert.equal(
       result.issues.some((issue) => issue.rule === "invalid-coverage-report"),
@@ -119,4 +120,75 @@ test("testing analyzer reports malformed coverage without crashing", async () =>
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+async function coverageConfigFinding(
+  files: Record<string, string>,
+  packageJson: Record<string, unknown> = {
+    devDependencies: { vitest: "1.0.0" },
+  },
+): Promise<boolean> {
+  const directory = createProject();
+  try {
+    writeFileSync(join(directory, "package.json"), JSON.stringify(packageJson));
+    for (const [name, content] of Object.entries(files)) {
+      writeFileSync(join(directory, name), content);
+    }
+    const result = await analyzeTesting(createScanContext(directory));
+    return result.issues.some((issue) => issue.rule === "no-coverage-config");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test("coverage thresholds are read from real configuration keys", async () => {
+  // Mentioning coverage, or collecting it without thresholds, is not a gate.
+  assert.equal(
+    await coverageConfigFinding({
+      "vitest.config.ts":
+        '// coverage runs in CI\nexport default { test: { coverage: { provider: "v8" } } };\n',
+    }),
+    true,
+  );
+  assert.equal(
+    await coverageConfigFinding({
+      "vitest.config.ts":
+        "export default { test: { coverage: { thresholds: { lines: 80 } } } };\n",
+    }),
+    false,
+  );
+  assert.equal(
+    await coverageConfigFinding({
+      "vite.config.mts":
+        "export default defineConfig({ test: { coverage: { lines: 80 } } });\n",
+    }),
+    false,
+  );
+  assert.equal(
+    await coverageConfigFinding(
+      {
+        "jest.config.js":
+          "module.exports = { coverageThreshold: { global: { lines: 80 } } };\n",
+      },
+      { devDependencies: { jest: "29.0.0" } },
+    ),
+    false,
+  );
+  assert.equal(
+    await coverageConfigFinding(
+      {},
+      {
+        scripts: {
+          test: "node --test --experimental-test-coverage --test-coverage-lines=80",
+        },
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    await coverageConfigFinding({
+      ".c8rc.json": '{ "check-coverage": true, "lines": 90 }',
+    }),
+    false,
+  );
 });

@@ -61,6 +61,10 @@ test("HTML reporter renders a complete interactive dashboard", () => {
     /Move it to an environment variable &amp; rotate &quot;now&quot;/,
   );
   assert.match(html, /No source code was uploaded/);
+  assert.match(
+    html,
+    /<time datetime="2026-01-01T00:00:00.000Z">2026-01-01 00:00 UTC<\/time>/,
+  );
   assert.match(html, /<\/html>$/);
 });
 
@@ -70,4 +74,24 @@ test("HTML reporter escapes untrusted report content", () => {
   assert.doesNotMatch(html, /<core>/);
   assert.doesNotMatch(html, /Credential <exposed>/);
   assert.match(html, /Credential &lt;exposed&gt;/);
+});
+
+test("HTML reporter explains lost points and root-caused findings", () => {
+  const result = fixture();
+  result.analyzers[0].scoreBreakdown = [
+    { rule: "secret-leak", count: 1, penalty: 25 },
+    { rule: "review", count: 3, penalty: 3.5 },
+  ];
+  result.analyzers[0].issues[1].causedBy = "secret-leak";
+
+  const html = renderHtml(result);
+
+  assert.match(html, /<ul class="breakdown" aria-label="Points lost by rule">/);
+  assert.match(
+    html,
+    /<li><code>secret-leak<\/code><span>×1<\/span><strong>-25<\/strong><\/li>/,
+  );
+  assert.match(html, /<strong>-3\.5<\/strong>/);
+  assert.match(html, /Security \/ review · caused by secret-leak/);
+  assert.doesNotMatch(renderHtml(fixture()), /class="breakdown"/);
 });

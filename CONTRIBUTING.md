@@ -8,7 +8,7 @@ scope and expected behavior can be agreed on first.
 
 Requirements:
 
-- Node.js 18 or newer
+- Node.js 20.19 or newer (CI runs 20, 22, and 24)
 - npm 9 or newer
 
 ```bash
@@ -33,6 +33,17 @@ node dist/index.js scan /path/to/project
 5. Update `CHANGELOG.md` when the change affects users.
 
 Analyzer changes should include fixtures for both positive and negative cases.
+Every finding uses a rule registered in `src/rules/registry.ts` through
+`fromRule()`. After adding or changing a rule, run `npm run docs:rules` to
+regenerate `docs/rules.md`; the test suite fails when it is stale.
+
+`tests/fixtures/realistic/` holds small, well-built NestJS, Express, and
+Next.js applications that must keep scoring at least 85 with no critical
+findings, and `tests/fixtures/defects/` holds applications that must keep
+producing specific findings (`tests/benchmark.test.ts`). When an analyzer
+change fails these tests, fix the analyzer rather than the fixture unless the
+fixture itself is wrong. The fixtures are excluded from Biome and from
+CodeDiag's own scan (`.codediag.yml`).
 Avoid checks that depend on network access unless the analyzer already owns
 that dependency and the failure mode is covered by tests.
 
@@ -48,6 +59,19 @@ Use a short conventional commit subject where practical:
 
 Pull requests should explain the problem, the chosen behavior, and the
 verification performed. Keep unrelated refactors in separate pull requests.
+
+## Releasing
+
+1. Move the `[Unreleased]` changelog entries under a new version heading and
+   set `version` in `package.json` (and `extensions/vscode/package.json` when
+   the extension changes) with `npm version <x.y.z> --no-git-tag-version`.
+2. Run `npm run check` and merge to `main`.
+3. Publish a GitHub release tagged `v<x.y.z>`. The Release workflow checks
+   that the tag matches `package.json`, runs `npm run check`, publishes to npm
+   with provenance (requires the `NPM_TOKEN` repository secret), and attaches
+   the VS Code `.vsix` to the release.
+4. Move the Action's major tag (for example `v0`) to the release commit so
+   `uses: sabahattink/codediag@v0` picks it up.
 
 ## Reporting security issues
 

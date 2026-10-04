@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  type AuditRunner,
+  analyzeDependencies,
+  clearAuditCache,
   parseAuditSummary,
   resolveAuditCommand,
 } from "../src/analyzers/dependencies.js";
+import { createScanContext } from "../src/core/scan-context.js";
 
 function withTempProject(run: (directory: string) => void): void {
   const directory = mkdtempSync(join(tmpdir(), "codediag-dependencies-"));
@@ -149,4 +153,139 @@ test("detects modern Yarn configuration at the monorepo root", () => {
     assert.equal(command.manager, "yarn");
     assert.deepEqual(command.args, ["npm", "audit", "--json", "--recursive"]);
   });
+});
+
+test("a missing lock file skips the audit and reports one clear finding", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-dependencies-"));
+  try {
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({
+        name: "app",
+        engines: { node: ">=20" },
+        scripts: { build: "tsc", start: "node ." },
+      }),
+    );
+
+    const result = await analyzeDependencies(createScanContext(directory));
+
+    assert.deepEqual(
+      result.issues.map((finding) => finding.rule),
+      ["no-lock-file"],
+    );
+    assert.match(result.issues[0].message, /cannot be audited/);
+    // The skipped audit still counts as a failed check in the analyzer score.
+    assert.equal(result.score, 60);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("audits can be skipped by config or scan option without network access", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-dependencies-"));
+  try {
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({
+        name: "app",
+        engines: { node: ">=20" },
+        scripts: { build: "tsc", start: "node ." },
+      }),
+    );
+    writeFileSync(join(directory, "package-lock.json"), "{}");
+    writeFileSync(join(directory, ".codediag.yml"), "audit: false\n");
+
+    const configured = await analyzeDependencies(createScanContext(directory));
+    assert.deepEqual(
+      configured.issues.map((issue) => [issue.rule, issue.severity]),
+      [["audit-skipped", "info"]],
+    );
+    // A deliberately skipped audit is not a failed check in the v1 score.
+    assert.equal(configured.score, 100);
+
+    rmSync(join(directory, ".codediag.yml"));
+    const optedOut = await analyzeDependencies(createScanContext(directory), {
+      audit: false,
+    });
+    assert.deepEqual(
+      optedOut.issues.map((issue) => issue.rule),
+      ["audit-skipped"],
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("cached audits reuse an earlier result for the same lock file", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-dependencies-"));
+  const vulnerable: AuditRunner = () => ({
+    stdout: JSON.stringify({
+      metadata: {
+        vulnerabilities: { critical: 0, high: 2, moderate: 0, low: 0 },
+      },
+    }),
+    stderr: "",
+  });
+  const unreachable: AuditRunner = () => {
+    throw new Error("cached scans must not run the package manager");
+  };
+  const rules = (result: Awaited<ReturnType<typeof analyzeDependencies>>) =>
+    result.issues.map((issue) => issue.rule);
+
+  try {
+    clearAuditCache();
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({
+        engines: { node: ">=20" },
+        scripts: { build: "x", start: "y" },
+      }),
+    );
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      '{"lockfileVersion":3}',
+    );
+    const context = () => createScanContext(directory);
+
+    assert.deepEqual(
+      rules(
+        await analyzeDependencies(context(), {
+          audit: "cached",
+          runAudit: unreachable,
+        }),
+      ),
+      ["audit-skipped"],
+    );
+    assert.deepEqual(
+      rules(await analyzeDependencies(context(), { runAudit: vulnerable })),
+      ["vuln-high"],
+    );
+    assert.deepEqual(
+      rules(
+        await analyzeDependencies(context(), {
+          audit: "cached",
+          runAudit: unreachable,
+        }),
+      ),
+      ["vuln-high"],
+    );
+
+    // A changed lock file invalidates the cached result.
+    writeFileSync(
+      join(directory, "package-lock.json"),
+      '{"lockfileVersion":3,"x":1}',
+    );
+    assert.deepEqual(
+      rules(
+        await analyzeDependencies(context(), {
+          audit: "cached",
+          runAudit: unreachable,
+        }),
+      ),
+      ["audit-skipped"],
+    );
+  } finally {
+    clearAuditCache();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

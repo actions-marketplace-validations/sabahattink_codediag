@@ -116,6 +116,7 @@ async function runScan(
   status: vscode.StatusBarItem,
   output: vscode.OutputChannel,
   preferredRoot?: string,
+  trigger: "command" | "save" = "command",
 ): Promise<LatestScan | undefined> {
   if (scanInFlight) return scanInFlight;
 
@@ -136,6 +137,9 @@ async function runScan(
         async (progress) =>
           scan(root, loadConfig(root), {
             interactive: false,
+            // Saves trigger frequent scans: reuse the last audit of the same
+            // lock file instead of blocking on the network.
+            ...(trigger === "save" ? { audit: "cached" as const } : {}),
             onProgress: (message) => progress.report({ message }),
           }),
       );
@@ -253,7 +257,7 @@ export function activate(context: vscode.ExtensionContext): void {
         root,
         setTimeout(() => {
           saveTimers.delete(root);
-          void runScan(diagnostics, status, output, root);
+          void runScan(diagnostics, status, output, root, "save");
         }, 750),
       );
     }),

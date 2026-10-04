@@ -1,0 +1,133 @@
+import { getRule } from "../rules/registry.js";
+import { isActive } from "./issues.js";
+import type {
+  AnalyzerResult,
+  DiagnosticIssue,
+  RuleSetting,
+  ScoreBreakdownEntry,
+  ScoringVersion,
+} from "../types.js";
+
+export const SEVERITY_WEIGHTS: Record<DiagnosticIssue["severity"], number> = {
+  critical: 25,
+  warning: 8,
+  info: 2,
+};
+
+/**
+ * Each further finding of the same rule costs half the previous one, so one
+ * rule can cost at most twice its highest severity weight.
+ */
+const REPEAT_DECAY = 0.5;
+
+/** Points lost, as shown in reports: "-8", "-12.5". */
+export function formatPenalty(penalty: number): string {
+  return `-${penalty}`;
+}
+
+/** Version 1 summaries describe checks, which version 2 scores do not use. */
+const CHECKS_SUMMARY = /^[\d.]+\/\d+ checks passed$/;
+
+function findingSummary(issues: DiagnosticIssue[]): string {
+  const counted = issues.filter((issue) => isActive(issue) && !issue.causedBy);
+  if (counted.length === 0) return "No findings";
+  const counts = { critical: 0, warning: 0, info: 0 };
+  for (const issue of counted) counts[issue.severity] += 1;
+  const parts = (["critical", "warning", "info"] as const)
+    .filter((severity) => counts[severity] > 0)
+    .map((severity) => `${counts[severity]} ${severity}`);
+  return `${counted.length} finding${counted.length === 1 ? "" : "s"}: ${parts.join(", ")}`;
+}
+
+function roundPenalty(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+/**
+ * Downgrades findings whose registered root cause is also reported to `info`
+ * and links them with `causedBy`, so one problem is penalized once.
+ */
+function linkRootCauses(results: AnalyzerResult[]): AnalyzerResult[] {
+  // Only active root causes explain other findings: a suppressed or baselined
+  // cause has been accepted, so its consequences must be judged on their own.
+  const reported = new Set(
+    results.flatMap((result) =>
+      result.issues.filter(isActive).map((issue) => issue.rule),
+    ),
+  );
+
+  return results.map((result) => ({
+    ...result,
+    issues: result.issues.map((issue) => {
+      const rootCause = getRule(issue.rule)?.rootCause;
+      if (!rootCause || !reported.has(rootCause)) return issue;
+      return { ...issue, severity: "info", causedBy: rootCause };
+    }),
+  }));
+}
+
+function scoreIssues(
+  issues: DiagnosticIssue[],
+  rules: Readonly<Record<string, RuleSetting>>,
+): {
+  score: number;
+  scoreBreakdown: ScoreBreakdownEntry[];
+} {
+  const byRule = new Map<string, DiagnosticIssue[]>();
+  for (const issue of issues) {
+    if (issue.causedBy || !isActive(issue)) continue;
+    byRule.set(issue.rule, [...(byRule.get(issue.rule) ?? []), issue]);
+  }
+
+  let total = 0;
+  const scoreBreakdown: ScoreBreakdownEntry[] = [];
+  for (const [rule, findings] of byRule) {
+    // A severity chosen in .codediag.yml replaces the "analyzer fails" rule.
+    const penalty =
+      getRule(rule)?.failsAnalyzer && !Object.hasOwn(rules, rule)
+        ? 100
+        : findings
+            .map((finding) => SEVERITY_WEIGHTS[finding.severity])
+            .sort((left, right) => right - left)
+            .reduce(
+              (sum, weight, index) => sum + weight * REPEAT_DECAY ** index,
+              0,
+            );
+    total += penalty;
+    scoreBreakdown.push({
+      rule,
+      count: findings.length,
+      penalty: roundPenalty(penalty),
+    });
+  }
+
+  scoreBreakdown.sort(
+    (left, right) =>
+      right.penalty - left.penalty || left.rule.localeCompare(right.rule),
+  );
+
+  return {
+    score: Math.max(0, Math.round(100 - total)),
+    scoreBreakdown,
+  };
+}
+
+/**
+ * Version 1 keeps each analyzer's own checks-passed score. Version 2 starts
+ * every analyzer at 100 and subtracts a severity-weighted penalty per finding.
+ */
+export function applyScoring(
+  results: AnalyzerResult[],
+  version: ScoringVersion,
+  rules: Readonly<Record<string, RuleSetting>> = {},
+): AnalyzerResult[] {
+  if (version === 1) return results;
+
+  return linkRootCauses(results).map((result) => ({
+    ...result,
+    summary: CHECKS_SUMMARY.test(result.summary)
+      ? findingSummary(result.issues)
+      : result.summary,
+    ...scoreIssues(result.issues, rules),
+  }));
+}

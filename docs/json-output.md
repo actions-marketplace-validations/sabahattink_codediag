@@ -44,6 +44,40 @@ https://raw.githubusercontent.com/sabahattink/codediag/main/schema/scan-result.s
 | `totalScore` | integer | Weighted score from 0 through 100 |
 | `grade` | string | `A+`, `A`, `B+`, `B`, `C`, `D`, or `F` |
 | `timestamp` | string | UTC ISO 8601 scan timestamp |
+| `scoringVersion` | integer | Scoring model used for analyzer scores: `1` or `2` |
+| `baseline` | object | Optional. `{ matched, fixed }` when the scan used a baseline |
+| `skipped` | object | Optional. Present only when source files were left out of analysis |
+
+`skipped` counts code files that were not analyzed: `tooLarge` (larger than
+`maxFileSizeKb`), `minified` (bundler or minifier output, detected by an
+average line length above 500 characters), and `unreadable`. `files` lists up
+to 50 of them as `{ "file", "reason" }`, sorted by path.
 
 Each diagnostic issue always includes `severity`, `rule`, and `message`.
-`file`, `line`, and `fix` are optional.
+Each analyzer result includes `name`, `score`, `issues`, and `summary`. With
+scoring version 2 it also includes `scoreBreakdown`: one `{ "rule", "count",
+"penalty" }` entry per rule that cost points, sorted by penalty. The penalties
+add up to `100 - score` before rounding and the floor at 0.
+
+`file`, `line`, `fix`, `fingerprint`, and `causedBy` are optional. `causedBy`
+names the reported rule a finding is a consequence of; such findings are
+`info` and are not penalized.
+
+`suppression` (`{ "kind": "inSource", "justification" }`) marks a finding
+suppressed by a `codediag-ignore` comment, and `baseline: true` marks a finding
+matched by the scan's baseline. Neither kind counts toward scores or
+thresholds; see [suppressions and baselines](suppressions-and-baselines.md). Rule IDs and their
+meaning are listed in [rules.md](rules.md).
+
+`fingerprint` is a SHA-256 hex digest that identifies a finding independently
+of its line number. It is derived from the rule ID, the file, and:
+
+- for findings on a source line, the line's whitespace-normalized text and the
+  message (for rules that flag credentials, such as `hardcoded-secret`, only
+  the message, so a secret is never hashed);
+- for findings on a file without a line, nothing else;
+- for project-level findings, the message with numbers masked, except for
+  vulnerability totals (`vuln-*`), where a changed count is a new finding.
+
+Identical findings are distinguished by their order. The same value is emitted
+as the `codediagFinding/v2` SARIF partial fingerprint.

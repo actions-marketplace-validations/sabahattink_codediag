@@ -1,7 +1,14 @@
-import { existsSync } from "node:fs";
-import { join, relative } from "node:path";
-import { glob } from "glob";
-import { Project, type SourceFile } from "ts-morph";
+import {
+  type ClassDeclaration,
+  type Decorator,
+  type MethodDeclaration,
+  Node,
+  type SourceFile,
+  SyntaxKind,
+  type TypeNode,
+} from "ts-morph";
+import type { ScanContext } from "../core/scan-context.js";
+import { fromRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue } from "../types.js";
 
 const HTTP_DECORATORS = [
@@ -12,6 +19,34 @@ const HTTP_DECORATORS = [
   "Patch",
   "Head",
   "Options",
+];
+const MUTATING_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
+const BODY_METHODS = ["POST", "PUT", "PATCH"];
+const SWAGGER_CLASS_DECORATORS = ["ApiTags", "ApiBearerAuth"];
+const SWAGGER_METHOD_DECORATORS = [
+  "ApiOperation",
+  "ApiResponse",
+  "ApiBody",
+  "ApiBearerAuth",
+];
+/** Metadata keys that conventionally mark a route as intentionally public. */
+const PUBLIC_METADATA = /public|skip.?auth|allow.?anonymous|no.?auth/i;
+const KNOWN_PUBLIC_DECORATORS = ["Public", "SkipAuth", "AllowAnonymous"];
+const NON_DTO_TYPES = new Set(["any", "unknown", "object", "Object"]);
+const PRIMITIVE_BODY_TYPES = new Set(["string", "number", "boolean"]);
+const STRUCTURAL_GENERICS = new Set([
+  "Record",
+  "Partial",
+  "Pick",
+  "Omit",
+  "Required",
+  "Readonly",
+  "Map",
+]);
+const TEST_EXCLUDES = [
+  "**/*.test.ts",
+  "**/*.spec.ts",
+  "**/{test,tests,__tests__,e2e}/**",
 ];
 
 interface EndpointInfo {
@@ -24,22 +59,250 @@ interface EndpointInfo {
   hasReturnType: boolean;
 }
 
+/** Project-wide facts that change how individual endpoints are judged. */
+interface NestFacts {
+  globalGuard: boolean;
+  globalValidation: boolean;
+  guardDecorators: Set<string>;
+  publicDecorators: Set<string>;
+  classes: Set<string>;
+  structuralTypes: Map<string, "interface" | "type">;
+}
+
+/** Names of exported helpers whose body contains a given call. */
+function helpersCalling(
+  sourceFile: SourceFile,
+  matches: (text: string) => boolean,
+): string[] {
+  const names: string[] = [];
+  for (const declaration of sourceFile.getFunctions()) {
+    const name = declaration.getName();
+    if (name && matches(declaration.getText())) names.push(name);
+  }
+  for (const declaration of sourceFile.getVariableDeclarations()) {
+    const initializer = declaration.getInitializer();
+    if (initializer && matches(initializer.getText())) {
+      names.push(declaration.getName());
+    }
+  }
+  return names;
+}
+
+function setsPublicMetadata(text: string): boolean {
+  for (const match of text.matchAll(/SetMetadata\(\s*([^,)]+)/g)) {
+    if (PUBLIC_METADATA.test(match[1])) return true;
+  }
+  return false;
+}
+
+function collectFacts(sourceFiles: SourceFile[]): NestFacts {
+  const facts: NestFacts = {
+    globalGuard: false,
+    globalValidation: false,
+    guardDecorators: new Set(["UseGuards"]),
+    publicDecorators: new Set(KNOWN_PUBLIC_DECORATORS),
+    classes: new Set(),
+    structuralTypes: new Map(),
+  };
+
+  for (const sourceFile of sourceFiles) {
+    for (const name of helpersCalling(sourceFile, (text) =>
+      /\bUseGuards\s*\(/.test(text),
+    )) {
+      facts.guardDecorators.add(name);
+    }
+    for (const name of helpersCalling(sourceFile, setsPublicMetadata)) {
+      facts.publicDecorators.add(name);
+    }
+    for (const declaration of sourceFile.getClasses()) {
+      const name = declaration.getName();
+      if (name) facts.classes.add(name);
+    }
+    for (const declaration of sourceFile.getInterfaces()) {
+      facts.structuralTypes.set(declaration.getName(), "interface");
+    }
+    for (const declaration of sourceFile.getTypeAliases()) {
+      facts.structuralTypes.set(declaration.getName(), "type");
+    }
+
+    for (const call of sourceFile.getDescendantsOfKind(
+      SyntaxKind.CallExpression,
+    )) {
+      const callee = call.getExpression();
+      if (!Node.isPropertyAccessExpression(callee)) continue;
+      if (callee.getName() === "useGlobalGuards") facts.globalGuard = true;
+      if (
+        callee.getName() === "useGlobalPipes" &&
+        /\bValidationPipe\b/.test(call.getText())
+      ) {
+        facts.globalValidation = true;
+      }
+    }
+
+    // { provide: APP_GUARD, useClass: JwtGuard } and APP_PIPE equivalents.
+    for (const literal of sourceFile.getDescendantsOfKind(
+      SyntaxKind.ObjectLiteralExpression,
+    )) {
+      const provide = literal.getProperty("provide");
+      if (!provide || !Node.isPropertyAssignment(provide)) continue;
+      const token = provide.getInitializer()?.getText();
+      if (token === "APP_GUARD") facts.globalGuard = true;
+      if (
+        token === "APP_PIPE" &&
+        /\bValidationPipe\b/.test(literal.getText())
+      ) {
+        facts.globalValidation = true;
+      }
+    }
+  }
+
+  return facts;
+}
+
+/** The first path from a string, a string array, or `{ path }` argument. */
+function decoratorPath(decorator: Decorator | undefined): string {
+  let argument: Node | undefined = decorator?.getArguments()[0];
+  if (argument && Node.isObjectLiteralExpression(argument)) {
+    const path = argument.getProperty("path");
+    argument =
+      path && Node.isPropertyAssignment(path)
+        ? path.getInitializer()
+        : undefined;
+  }
+  if (argument && Node.isArrayLiteralExpression(argument)) {
+    argument = argument.getElements()[0];
+  }
+  if (
+    argument &&
+    (Node.isStringLiteral(argument) ||
+      Node.isNoSubstitutionTemplateLiteral(argument))
+  ) {
+    return argument.getLiteralText();
+  }
+  return "";
+}
+
+function hasDecorator(
+  node: ClassDeclaration | MethodDeclaration,
+  names: ReadonlySet<string> | readonly string[],
+): boolean {
+  const list = names instanceof Set ? names : new Set(names);
+  return node
+    .getDecorators()
+    .some((decorator) => list.has(decorator.getName()));
+}
+
+function usesValidationPipe(
+  node: ClassDeclaration | MethodDeclaration,
+): boolean {
+  return node
+    .getDecorators()
+    .some(
+      (decorator) =>
+        decorator.getName() === "UsePipes" &&
+        /\bValidationPipe\b/.test(decorator.getText()),
+    );
+}
+
+type BodyCheck =
+  | { kind: "none" }
+  | { kind: "dto"; validatedClass: boolean; validated: boolean }
+  | { kind: "structural"; description: string; interfaceName?: string };
+
+/** Classifies a body parameter's type: only classes can be validated. */
+function classifyBodyType(
+  typeNode: TypeNode | undefined,
+  facts: NestFacts,
+): BodyCheck {
+  if (!typeNode) {
+    return { kind: "structural", description: "an untyped parameter" };
+  }
+  if (Node.isArrayTypeNode(typeNode)) {
+    return classifyBodyType(typeNode.getElementTypeNode(), facts);
+  }
+  if (Node.isTypeReference(typeNode)) {
+    const name = typeNode.getTypeName().getText();
+    if (STRUCTURAL_GENERICS.has(name) || NON_DTO_TYPES.has(name)) {
+      return { kind: "structural", description: typeNode.getText() };
+    }
+    const structural = facts.structuralTypes.get(name);
+    if (structural === "interface") {
+      return {
+        kind: "structural",
+        description: `interface ${name}`,
+        interfaceName: name,
+      };
+    }
+    if (structural === "type") {
+      return { kind: "structural", description: `type ${name}` };
+    }
+    // Project classes are DTOs; types from packages are assumed to be.
+    return {
+      kind: "dto",
+      validatedClass: facts.classes.has(name),
+      validated: false,
+    };
+  }
+  // Raw text, numeric, or boolean bodies are deliberate and need no DTO.
+  if (PRIMITIVE_BODY_TYPES.has(typeNode.getText())) return { kind: "none" };
+  return { kind: "structural", description: typeNode.getText() };
+}
+
+function bodyCheck(
+  method: MethodDeclaration,
+  controller: ClassDeclaration,
+  facts: NestFacts,
+): BodyCheck {
+  const body = method
+    .getParameters()
+    .find((parameter) =>
+      parameter
+        .getDecorators()
+        .some((decorator) => decorator.getName() === "Body"),
+    );
+  if (!body) return { kind: "none" };
+  const bodyArguments = body
+    .getDecorators()
+    .find((decorator) => decorator.getName() === "Body")
+    ?.getArguments();
+  // @Body("field") extracts one property; it is not a request body DTO.
+  if (
+    bodyArguments?.some(
+      (argument) =>
+        Node.isStringLiteral(argument) ||
+        Node.isNoSubstitutionTemplateLiteral(argument),
+    )
+  ) {
+    return { kind: "none" };
+  }
+
+  const result = classifyBodyType(body.getTypeNode(), facts);
+  if (result.kind !== "dto") return result;
+  const bodyDecorator = body
+    .getDecorators()
+    .find((decorator) => decorator.getName() === "Body");
+  return {
+    ...result,
+    validated:
+      facts.globalValidation ||
+      usesValidationPipe(method) ||
+      usesValidationPipe(controller) ||
+      /\bValidationPipe\b/.test(bodyDecorator?.getText() ?? ""),
+  };
+}
+
+function joinPath(base: string, route: string): string {
+  return `/${base}/${route}`.replace(/\/+/g, "/").replace(/\/$/, "") || "/";
+}
+
 export async function analyzeNestjsApi(
-  projectPath: string,
-  ignore: string[] = ["node_modules/**", "dist/**"],
+  context: ScanContext,
 ): Promise<AnalyzerResult> {
   const issues: DiagnosticIssue[] = [];
   const endpoints: EndpointInfo[] = [];
 
-  const controllerFiles = await glob("**/*.controller.ts", {
-    cwd: projectPath,
-    ignore: [
-      ...ignore,
-      "**/*.test.ts",
-      "**/*.spec.ts",
-      "**/{test,tests,__tests__,e2e}/**",
-    ],
-    absolute: true,
+  const controllerFiles = context.matchFiles("**/*.controller.ts", {
+    exclude: TEST_EXCLUDES,
   });
 
   if (controllerFiles.length === 0) {
@@ -48,8 +311,7 @@ export async function analyzeNestjsApi(
       score: 0,
       issues: [
         {
-          severity: "critical",
-          rule: "no-controllers",
+          ...fromRule("no-controllers"),
           message: "No controller files found (*.controller.ts)",
         },
       ],
@@ -57,125 +319,91 @@ export async function analyzeNestjsApi(
     };
   }
 
-  const tsConfigPath = join(projectPath, "tsconfig.json");
-  let project: Project;
+  const facts = collectFacts(
+    context
+      .matchFiles("**/*.ts", { exclude: [...TEST_EXCLUDES, "**/*.d.ts"] })
+      .flatMap((file) => context.getSourceFile(file) ?? []),
+  );
+  let unvalidatedDto: { file: string; line: number } | undefined;
 
-  try {
-    if (existsSync(tsConfigPath)) {
-      project = new Project({
-        tsConfigFilePath: tsConfigPath,
-        skipAddingFilesFromTsConfig: true,
-      });
-    } else {
-      project = new Project({ compilerOptions: { strict: true } });
-    }
-  } catch {
-    project = new Project({ compilerOptions: { strict: true } });
-  }
+  for (const relFile of controllerFiles) {
+    const sourceFile = context.getSourceFile(relFile);
+    if (!sourceFile) continue;
 
-  for (const filePath of controllerFiles) {
-    let sourceFile: SourceFile;
-    try {
-      sourceFile = project.addSourceFileAtPath(filePath);
-    } catch {
-      continue;
-    }
-
-    const classes = sourceFile.getClasses();
-
-    for (const cls of classes) {
+    for (const cls of sourceFile.getClasses()) {
       const controllerDecorator = cls.getDecorator("Controller");
       if (!controllerDecorator) continue;
 
-      const args = controllerDecorator.getArguments();
-      const basePath = args[0]?.getText().replace(/['"]/g, "") || "";
-      const classHasGuard = cls
-        .getDecorators()
-        .some((d) => d.getName() === "UseGuards");
-      const classHasSwagger = cls
-        .getDecorators()
-        .some((d) => ["ApiTags", "ApiBearerAuth"].includes(d.getName()));
+      const basePath = decoratorPath(controllerDecorator);
+      const classHasGuard = hasDecorator(cls, facts.guardDecorators);
+      const classIsPublic = hasDecorator(cls, facts.publicDecorators);
+      const classHasSwagger = hasDecorator(cls, SWAGGER_CLASS_DECORATORS);
 
       for (const method of cls.getMethods()) {
-        const decorators = method.getDecorators();
-        const httpDec = decorators.find((d) =>
-          HTTP_DECORATORS.includes(d.getName()),
-        );
+        const httpDec = method
+          .getDecorators()
+          .find((decorator) => HTTP_DECORATORS.includes(decorator.getName()));
         if (!httpDec) continue;
 
         const httpMethod = httpDec.getName().toUpperCase();
-        const routePath =
-          httpDec.getArguments()[0]?.getText().replace(/['"]/g, "") || "";
-        const fullPath =
-          `/${basePath}/${routePath}`.replace(/\/+/g, "/").replace(/\/$/, "") ||
-          "/";
-        const relFile = relative(projectPath, filePath).replace(/\\/g, "/");
+        const fullPath = joinPath(basePath, decoratorPath(httpDec));
         const line = method.getStartLineNumber();
 
         const hasGuard =
-          classHasGuard || decorators.some((d) => d.getName() === "UseGuards");
-
-        const hasDto = method.getParameters().some((p) => {
-          const typeNode = p.getTypeNode();
-          return Boolean(
-            p.getDecorators().some((d) => d.getName() === "Body") &&
-              typeNode &&
-              !["any", "unknown", "object"].includes(typeNode.getText()),
-          );
-        });
-
+          facts.globalGuard ||
+          classHasGuard ||
+          hasDecorator(method, facts.guardDecorators);
+        const isPublic =
+          classIsPublic || hasDecorator(method, facts.publicDecorators);
+        const body = bodyCheck(method, cls, facts);
         const hasSwagger =
-          classHasSwagger ||
-          decorators.some((d) =>
-            [
-              "ApiOperation",
-              "ApiResponse",
-              "ApiBody",
-              "ApiBearerAuth",
-            ].includes(d.getName()),
-          );
-
+          classHasSwagger || hasDecorator(method, SWAGGER_METHOD_DECORATORS);
         const hasReturnType = method.getReturnTypeNode() !== undefined;
 
         endpoints.push({
           method: httpMethod,
           path: fullPath,
           file: relFile,
-          hasGuard,
-          hasDto,
+          hasGuard: hasGuard || isPublic,
+          hasDto: body.kind !== "structural",
           hasSwagger,
           hasReturnType,
         });
 
-        if (
-          !hasGuard &&
-          ["POST", "PUT", "DELETE", "PATCH"].includes(httpMethod)
-        ) {
+        if (!hasGuard && !isPublic && MUTATING_METHODS.includes(httpMethod)) {
           issues.push({
-            severity: "warning",
-            rule: "missing-guard",
+            ...fromRule("missing-guard"),
             message: `${httpMethod} ${fullPath} has no auth guard`,
             file: relFile,
             line,
-            fix: "Add @UseGuards(AuthGuard) to protect this endpoint",
+            fix: "Add @UseGuards(AuthGuard), register a global guard, or mark the route @Public() if it is intentionally open",
           });
         }
 
-        if (!hasDto && ["POST", "PUT", "PATCH"].includes(httpMethod)) {
+        if (body.kind === "structural" && BODY_METHODS.includes(httpMethod)) {
           issues.push({
-            severity: "warning",
-            rule: "missing-dto",
-            message: `${httpMethod} ${fullPath} has no typed DTO for request body`,
+            ...fromRule("missing-dto"),
+            message: body.interfaceName
+              ? `${httpMethod} ${fullPath} uses ${body.description} for its request body; only classes can be validated at runtime`
+              : `${httpMethod} ${fullPath} uses ${body.description} for its request body; declare a DTO class`,
             file: relFile,
             line,
-            fix: "Create a DTO class with class-validator decorators",
+            fix: "Declare a DTO class with class-validator decorators and use it as the @Body() type",
           });
+        }
+
+        if (
+          body.kind === "dto" &&
+          body.validatedClass &&
+          !body.validated &&
+          !unvalidatedDto
+        ) {
+          unvalidatedDto = { file: relFile, line };
         }
 
         if (!hasSwagger) {
           issues.push({
-            severity: "info",
-            rule: "missing-swagger",
+            ...fromRule("missing-swagger"),
             message: `${httpMethod} ${fullPath} has no Swagger documentation`,
             file: relFile,
             line,
@@ -185,8 +413,7 @@ export async function analyzeNestjsApi(
 
         if (!hasReturnType) {
           issues.push({
-            severity: "info",
-            rule: "missing-return-type",
+            ...fromRule("missing-return-type"),
             message: `${httpMethod} ${fullPath} has no explicit return type`,
             file: relFile,
             line,
@@ -196,14 +423,23 @@ export async function analyzeNestjsApi(
     }
   }
 
+  if (unvalidatedDto) {
+    issues.push({
+      ...fromRule("dto-not-validated"),
+      message:
+        "Request DTO classes are used but no ValidationPipe validates them, so their decorators are not enforced",
+      ...unvalidatedDto,
+      fix: "Register app.useGlobalPipes(new ValidationPipe({ whitelist: true })) or an APP_PIPE provider",
+    });
+  }
+
   if (endpoints.length === 0) {
     return {
       name: "API Health",
       score: 50,
       issues: [
         {
-          severity: "warning",
-          rule: "no-endpoints",
+          ...fromRule("no-endpoints"),
           message: "Controllers found but no HTTP endpoints detected",
         },
       ],
@@ -212,7 +448,7 @@ export async function analyzeNestjsApi(
   }
 
   const mutatingEndpoints = endpoints.filter((e) =>
-    ["POST", "PUT", "PATCH"].includes(e.method),
+    BODY_METHODS.includes(e.method),
   );
   const guardRate =
     endpoints.filter((e) => e.hasGuard).length / endpoints.length;

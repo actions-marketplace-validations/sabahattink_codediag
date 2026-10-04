@@ -1,7 +1,27 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { glob } from "glob";
+import { Node, SyntaxKind } from "ts-morph";
+import type { ScanContext } from "../core/scan-context.js";
+import { fromRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue } from "../types.js";
+
+const TEST_CONFIG_FILES = ["jest", "vitest"].flatMap((tool) =>
+  ["ts", "js", "mjs", "mts"].map((extension) => `${tool}.config.${extension}`),
+);
+const COVERAGE_CONFIG_FILES = [
+  ...TEST_CONFIG_FILES,
+  ...["ts", "js", "mjs", "mts", "cjs", "cts"].map(
+    (extension) => `vite.config.${extension}`,
+  ),
+  "jest.config.cjs",
+  "jest.config.cts",
+  "vitest.config.cjs",
+  "vitest.config.cts",
+];
+const METRIC_KEYS = new Set(["lines", "statements", "functions", "branches"]);
+const COVERAGE_RC_FILES = [".c8rc", ".c8rc.json", ".nycrc", ".nycrc.json"];
+const COVERAGE_SCRIPT =
+  /--test-coverage-(?:lines|branches|functions)=\d|--check-coverage\b|\bc8\b[^&|;]*--(?:lines|branches|functions|statements)\b/;
 
 const COVERAGE_THRESHOLDS = {
   lines: 80,
@@ -85,27 +105,101 @@ function readCoverageReport(projectPath: string): CoverageReport | null {
   };
 }
 
+function propertyName(node: Node): string | undefined {
+  return Node.isPropertyAssignment(node) ||
+    Node.isShorthandPropertyAssignment(node)
+    ? node.getName().replace(/["']/g, "")
+    : undefined;
+}
+
+/**
+ * Jest `coverageThreshold`, Vitest `coverage.thresholds`, or Vitest 0.x style
+ * metric keys directly under `coverage` in a test or Vite config file.
+ */
+function configDeclaresThreshold(context: ScanContext, file: string): boolean {
+  const sourceFile = context.getSourceFile(file);
+  if (!sourceFile) return false;
+  for (const property of sourceFile.getDescendantsOfKind(
+    SyntaxKind.PropertyAssignment,
+  )) {
+    const name = propertyName(property);
+    if (name === "coverageThreshold") return true;
+    const parent = property
+      .getParentIfKind(SyntaxKind.ObjectLiteralExpression)
+      ?.getParent();
+    const parentName = parent ? propertyName(parent) : undefined;
+    if (
+      parentName === "coverage" &&
+      (name === "thresholds" || METRIC_KEYS.has(name ?? ""))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function coverageRcDeclaresThreshold(projectPath: string): boolean {
+  return COVERAGE_RC_FILES.some((name) => {
+    const path = join(projectPath, name);
+    if (!existsSync(path)) return false;
+    try {
+      const options = JSON.parse(readFileSync(path, "utf-8"));
+      return (
+        options?.["check-coverage"] === true ||
+        Object.keys(options ?? {}).some((key) => METRIC_KEYS.has(key))
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
+function hasCoverageThreshold(context: ScanContext): boolean {
+  const pkg = context.packageJson as
+    | (Record<string, unknown> & { scripts?: Record<string, string> })
+    | null;
+  const jest = pkg?.jest as { coverageThreshold?: unknown } | undefined;
+  const packageTool = (name: string) => {
+    const options = pkg?.[name] as Record<string, unknown> | undefined;
+    return Boolean(
+      options &&
+        (options["check-coverage"] === true ||
+          Object.keys(options).some((key) => METRIC_KEYS.has(key))),
+    );
+  };
+  return (
+    Boolean(jest?.coverageThreshold) ||
+    packageTool("c8") ||
+    packageTool("nyc") ||
+    Object.values(pkg?.scripts ?? {}).some((script) =>
+      COVERAGE_SCRIPT.test(script),
+    ) ||
+    coverageRcDeclaresThreshold(context.projectPath) ||
+    COVERAGE_CONFIG_FILES.some(
+      (file) =>
+        existsSync(join(context.projectPath, file)) &&
+        configDeclaresThreshold(context, file),
+    )
+  );
+}
+
 export async function analyzeTesting(
-  projectPath: string,
-  ignore: string[] = ["node_modules/**", "dist/**"],
+  context: ScanContext,
 ): Promise<AnalyzerResult> {
+  const { projectPath, packageJson: pkg } = context;
   const issues: DiagnosticIssue[] = [];
   let checksRun = 0;
   let checksPassed = 0;
 
   // 1. Test files exist
   checksRun++;
-  const testFiles = await glob("**/*.{spec,test}.{ts,js,tsx,jsx}", {
-    cwd: projectPath,
-    ignore,
-  });
+  const testFiles = context.matchFiles("**/*.{spec,test}.{ts,js,tsx,jsx}");
 
   if (testFiles.length > 0) {
     checksPassed++;
   } else {
     issues.push({
-      severity: "critical",
-      rule: "no-test-files",
+      ...fromRule("no-test-files"),
       message: "No test files found (*.spec.ts, *.test.ts)",
       fix: "Create test files alongside your source code",
     });
@@ -113,33 +207,25 @@ export async function analyzeTesting(
 
   // 2. Test framework detected
   checksRun++;
-  const pkgPath = join(projectPath, "package.json");
   let framework = "none";
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-      if (deps.jest || deps["@jest/core"] || deps["ts-jest"])
-        framework = "jest";
-      else if (deps.vitest) framework = "vitest";
-      else if (deps.mocha) framework = "mocha";
-      else if (deps.ava) framework = "ava";
-      else if (
-        pkg.scripts?.test?.includes("--test") ||
-        pkg.scripts?.["test:cli"]?.includes("--test")
-      )
-        framework = "node:test";
-    } catch {
-      /* skip */
-    }
+  if (pkg) {
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    if (deps.jest || deps["@jest/core"] || deps["ts-jest"]) framework = "jest";
+    else if (deps.vitest) framework = "vitest";
+    else if (deps.mocha) framework = "mocha";
+    else if (deps.ava) framework = "ava";
+    else if (
+      pkg.scripts?.test?.includes("--test") ||
+      pkg.scripts?.["test:cli"]?.includes("--test")
+    )
+      framework = "node:test";
   }
 
   if (framework !== "none") {
     checksPassed++;
   } else {
     issues.push({
-      severity: "warning",
-      rule: "no-test-framework",
+      ...fromRule("no-test-framework"),
       message: "No test framework detected",
       fix: "Install jest or vitest",
     });
@@ -147,9 +233,8 @@ export async function analyzeTesting(
 
   // 3. Test-to-source ratio
   checksRun++;
-  const sourceFiles = await glob("**/*.{ts,js,tsx,jsx}", {
-    cwd: projectPath,
-    ignore: [...ignore, "**/*.spec.*", "**/*.test.*", "**/*.d.ts"],
+  const sourceFiles = context.matchFiles("**/*.{ts,js,tsx,jsx}", {
+    exclude: ["**/*.spec.*", "**/*.test.*", "**/*.d.ts"],
   });
 
   const ratio =
@@ -159,15 +244,13 @@ export async function analyzeTesting(
   } else if (ratio > 0) {
     checksPassed += 0.5;
     issues.push({
-      severity: "info",
-      rule: "low-test-ratio",
+      ...fromRule("low-test-ratio"),
       message: `Test ratio: ${Math.round(ratio * 100)}% (${testFiles.length} tests / ${sourceFiles.length} source files)`,
       fix: "Aim for at least 1 test file per 3 source files",
     });
   } else {
     issues.push({
-      severity: "warning",
-      rule: "zero-test-ratio",
+      ...fromRule("zero-test-ratio"),
       message: "No test files relative to source files",
     });
   }
@@ -181,8 +264,7 @@ export async function analyzeTesting(
     checksPassed++;
   } else {
     issues.push({
-      severity: "info",
-      rule: "no-e2e-dir",
+      ...fromRule("no-e2e-dir"),
       message: "No e2e/test directory found",
       fix: "Create a test/ or e2e/ directory for integration tests",
     });
@@ -203,8 +285,7 @@ export async function analyzeTesting(
   } else {
     if (framework !== "none") {
       issues.push({
-        severity: "info",
-        rule: "no-test-config",
+        ...fromRule("no-test-config"),
         message: `No ${framework} config file found`,
         fix: `Create ${framework}.config.ts`,
       });
@@ -213,33 +294,7 @@ export async function analyzeTesting(
 
   // 6. Coverage report or threshold configuration
   checksRun++;
-  let hasCoverageConfig = false;
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-      if (pkg.jest?.coverageThreshold) hasCoverageConfig = true;
-    } catch {
-      /* skip */
-    }
-  }
-
-  const configFiles = await glob("{jest,vitest}.config.{ts,js,mjs,mts}", {
-    cwd: projectPath,
-    absolute: true,
-  });
-  for (const cf of configFiles) {
-    try {
-      if (
-        readFileSync(cf, "utf-8").includes("coverageThreshold") ||
-        readFileSync(cf, "utf-8").includes("coverage")
-      ) {
-        hasCoverageConfig = true;
-        break;
-      }
-    } catch {
-      /* skip */
-    }
-  }
+  const hasCoverageConfig = hasCoverageThreshold(context);
 
   let coverageReport: CoverageReport | null = null;
   let invalidCoverageReport = false;
@@ -248,8 +303,7 @@ export async function analyzeTesting(
   } catch (error) {
     invalidCoverageReport = true;
     issues.push({
-      severity: "warning",
-      rule: "invalid-coverage-report",
+      ...fromRule("invalid-coverage-report"),
       message: `Coverage summary could not be read: ${
         error instanceof Error ? error.message : String(error)
       }`,
@@ -279,8 +333,8 @@ export async function analyzeTesting(
         (name) => coverageReport.metrics[name].pct < 50,
       );
       issues.push({
+        ...fromRule("coverage-below-threshold"),
         severity: isCritical ? "critical" : "warning",
-        rule: "coverage-below-threshold",
         message: `Coverage below recommended thresholds: ${details}`,
         file: coverageReport.file,
         fix: "Add tests for the uncovered code paths and regenerate coverage",
@@ -290,8 +344,7 @@ export async function analyzeTesting(
     checksPassed++;
   } else if (!invalidCoverageReport) {
     issues.push({
-      severity: "info",
-      rule: "no-coverage-config",
+      ...fromRule("no-coverage-config"),
       message: "No coverage threshold configured",
       fix: "Add coverageThreshold to jest/vitest config",
     });

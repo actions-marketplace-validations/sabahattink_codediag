@@ -16,5 +16,25 @@
       "quoteStyle": "double",
       "semicolons": "always"
     }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "tests/**"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noTemplateCurlyInString": "off"
+          }
+        }
+      }
+    }
+  ],
+  "files": {
+    "includes": [
+      "**",
+      "!tests/fixtures"
+    ]
   }
 }

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
-import { glob } from "glob";
+import type { ScanContext } from "../core/scan-context.js";
+import { fromRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue } from "../types.js";
 import { analyzeSecuritySinks } from "./security-sinks.js";
 
@@ -29,6 +30,8 @@ const SECRET_PATTERNS = [
     name: "AWS Key",
   },
 ];
+
+const SOURCE_PATTERN = "**/*.{ts,tsx,js,jsx,mjs,cjs}";
 
 const RUNTIME_IGNORES = [
   "**/*.test.{ts,tsx,js,jsx,mjs,cjs}",
@@ -283,8 +286,7 @@ function passwordIssues(sources: SourceRecord[]): DiagnosticIssue[] {
     const weakMatch = weakHash.exec(source.content);
     if (weakMatch) {
       issues.push({
-        severity: "critical",
-        rule: "weak-password-hash",
+        ...fromRule("weak-password-hash"),
         message: "Password handling uses MD5 or SHA-1",
         file: source.file,
         line: lineNumberAt(source.content, weakMatch.index),
@@ -295,8 +297,7 @@ function passwordIssues(sources: SourceRecord[]): DiagnosticIssue[] {
     const comparisonMatch = directComparison.exec(source.content);
     if (comparisonMatch) {
       issues.push({
-        severity: "critical",
-        rule: "plaintext-password-comparison",
+        ...fromRule("plaintext-password-comparison"),
         message: "Password values appear to be compared directly",
         file: source.file,
         line: lineNumberAt(source.content, comparisonMatch.index),
@@ -307,8 +308,7 @@ function passwordIssues(sources: SourceRecord[]): DiagnosticIssue[] {
     const persistenceMatch = persistence.exec(source.content);
     if (persistenceMatch && !secureHash.test(source.content) && !weakMatch) {
       issues.push({
-        severity: "warning",
-        rule: "password-hashing-not-detected",
+        ...fromRule("password-hashing-not-detected"),
         message:
           "Password data may be persisted without recognizable password hashing",
         file: source.file,
@@ -321,49 +321,38 @@ function passwordIssues(sources: SourceRecord[]): DiagnosticIssue[] {
   return issues;
 }
 
-async function readSources(
-  projectPath: string,
-  ignore: string[],
-  runtimeOnly: boolean,
-): Promise<SourceRecord[]> {
-  const files = await glob("**/*.{ts,tsx,js,jsx,mjs,cjs}", {
-    cwd: projectPath,
-    ignore: runtimeOnly ? [...ignore, ...RUNTIME_IGNORES] : ignore,
-    absolute: true,
-    nodir: true,
-  });
-  const sources: SourceRecord[] = [];
-  for (const filePath of files) {
-    try {
-      sources.push({
-        file: relative(projectPath, filePath).replace(/\\/g, "/"),
-        content: stripComments(readFileSync(filePath, "utf-8")),
-      });
-    } catch {
-      // Files that disappear during a scan cannot be analyzed.
-    }
+function readSources(context: ScanContext): {
+  allSources: SourceRecord[];
+  runtimeSources: SourceRecord[];
+} {
+  const runtimeFiles = new Set(
+    context.matchFiles(SOURCE_PATTERN, { exclude: RUNTIME_IGNORES }),
+  );
+  const allSources: SourceRecord[] = [];
+  const runtimeSources: SourceRecord[] = [];
+  for (const file of context.matchFiles(SOURCE_PATTERN)) {
+    const content = context.readText(file);
+    // Files that cannot be read are reported in the scan's skipped summary.
+    if (content === null) continue;
+    const source = { file, content: stripComments(content) };
+    allSources.push(source);
+    if (runtimeFiles.has(file)) runtimeSources.push(source);
   }
-  return sources;
+  return { allSources, runtimeSources };
 }
 
 export async function analyzeSecurity(
-  projectPath: string,
-  ignore: string[] = ["node_modules/**", "dist/**"],
+  context: ScanContext,
 ): Promise<AnalyzerResult> {
+  const { projectPath } = context;
   const issues: DiagnosticIssue[] = [];
   let checksRun = 0;
   let checksPassed = 0;
-  const pkgPath = join(projectPath, "package.json");
-  let dependencies: Record<string, unknown> = {};
-
-  if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-      dependencies = { ...pkg.dependencies, ...pkg.devDependencies };
-    } catch {
-      // Invalid package metadata is reported by the dependency analyzer.
-    }
-  }
+  // Invalid package metadata is reported by the dependency analyzer.
+  const dependencies: Record<string, unknown> = {
+    ...context.packageJson?.dependencies,
+    ...context.packageJson?.devDependencies,
+  };
 
   const isWebServer = [
     "@nestjs/core",
@@ -386,8 +375,7 @@ export async function analyzeSecurity(
           checksPassed++;
         } else {
           issues.push({
-            severity: "critical",
-            rule: "env-not-gitignored",
+            ...fromRule("env-not-gitignored"),
             message:
               ".env is not ignored by .gitignore — secrets may be committed",
             file: relative(projectPath, gitignorePath).replace(/\\/g, "/"),
@@ -402,28 +390,28 @@ export async function analyzeSecurity(
     }
     if (!foundGitignore) {
       issues.push({
-        severity: "critical",
-        rule: "no-gitignore",
+        ...fromRule("no-gitignore"),
         message: "No .gitignore file found",
         fix: "Create .gitignore with .env, node_modules, and dist",
       });
     }
   }
 
-  const allSources = await readSources(projectPath, ignore, false);
-  const runtimeSources = await readSources(projectPath, ignore, true);
+  const { allSources, runtimeSources } = readSources(context);
 
   checksRun++;
   let secretsFound = false;
   for (const source of allSources) {
     for (const { pattern, name } of SECRET_PATTERNS) {
       pattern.lastIndex = 0;
-      const match = pattern.exec(source.content);
-      if (!match) continue;
+      // A value built with ${...} interpolation is not a hardcoded secret.
+      const match = [...source.content.matchAll(pattern)].find(
+        (candidate) => !candidate[0].includes("${"),
+      );
+      if (!match || match.index === undefined) continue;
       secretsFound = true;
       issues.push({
-        severity: "critical",
-        rule: "hardcoded-secret",
+        ...fromRule("hardcoded-secret"),
         message: `Possible ${name} found in source code`,
         file: source.file,
         line: lineNumberAt(source.content, match.index),
@@ -444,7 +432,7 @@ export async function analyzeSecurity(
   }
 
   checksRun++;
-  const sinkIssues = await analyzeSecuritySinks(projectPath, ignore);
+  const sinkIssues = await analyzeSecuritySinks(context);
   if (sinkIssues.length === 0) checksPassed++;
   issues.push(...sinkIssues);
 
@@ -454,8 +442,7 @@ export async function analyzeSecurity(
       checksPassed++;
     } else {
       issues.push({
-        severity: "warning",
-        rule: "no-helmet",
+        ...fromRule("no-helmet"),
         message: "Helmet middleware is not invoked in runtime source",
         fix: "Install and invoke Helmet or the framework-specific Helmet plugin",
       });
@@ -467,8 +454,7 @@ export async function analyzeSecurity(
       checksPassed++;
     } else {
       issues.push({
-        severity: "warning",
-        rule: "open-cors",
+        ...fromRule("open-cors"),
         message: "CORS is enabled without an origin allowlist",
         file: openCors.file,
         line: openCors.line,
@@ -481,8 +467,7 @@ export async function analyzeSecurity(
       checksPassed++;
     } else {
       issues.push({
-        severity: "warning",
-        rule: "no-rate-limiting",
+        ...fromRule("no-rate-limiting"),
         message: "Rate limiting is not configured in runtime source",
         fix: "Configure a rate limiter appropriate for the web framework",
       });

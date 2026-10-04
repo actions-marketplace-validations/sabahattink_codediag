@@ -1,16 +1,23 @@
-import { existsSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import chalk from "chalk";
 import { Command } from "commander";
 import { isBelowThreshold, loadConfig, parseThreshold } from "./config.js";
+import { loadBaseline } from "./core/baseline.js";
 import { renderHtml } from "./reporters/html.js";
 import { renderAiPrompt, renderFixPlan } from "./reporters/fix-plan.js";
 import { renderJson } from "./reporters/json.js";
+import { renderMarkdown } from "./reporters/markdown.js";
+import {
+  renderRuleExplanation,
+  renderRuleList,
+  ruleListJson,
+  suggestRules,
+} from "./reporters/rules.js";
 import { renderSarif } from "./reporters/sarif.js";
 import { renderSvg } from "./reporters/svg.js";
 import { renderTerminal } from "./reporters/terminal.js";
 import { scan } from "./scanner.js";
-import type { ScanResult } from "./types.js";
 import { getPackageVersion } from "./version.js";
 
 const OUTPUT_FORMATS = new Set([
@@ -23,29 +30,6 @@ const OUTPUT_FORMATS = new Set([
   "fixes",
   "prompt",
 ]);
-
-function renderMarkdown(result: ScanResult): string {
-  const lines = [
-    `## codediag \u2014 Diagnostic Report`,
-    ``,
-    `| Metric | Score |`,
-    `|--------|-------|`,
-  ];
-
-  for (const a of result.analyzers) {
-    const icon =
-      a.score >= 80 ? "\u2705" : a.score >= 60 ? "\u26A0\uFE0F" : "\u274C";
-    lines.push(`| ${icon} ${a.name} | ${a.score}/100 |`);
-  }
-
-  lines.push(`| **Total** | **${result.totalScore}/100 (${result.grade})** |`);
-  lines.push(``);
-  lines.push(
-    `> Scanned by [codediag](https://github.com/sabahattink/codediag) on ${new Date().toLocaleDateString()}`,
-  );
-
-  return lines.join("\n");
-}
 
 const program = new Command();
 
@@ -69,12 +53,26 @@ program
     "terminal",
   )
   .option("-t, --threshold <number>", "Minimum passing score")
-  .option("--ci", "CI mode: JSON output + exit code")
+  .option(
+    "--ci",
+    "CI mode: JSON output unless --format is given, and enforce the threshold",
+  )
   .option("--quiet", "Show score only")
   .option("--verbose", "Show all issues including info")
-  .action(async (path: string, options) => {
+  .option("--no-audit", "Skip the package manager audit (no network access)")
+  .option(
+    "--baseline <report>",
+    "JSON report whose findings are accepted and excluded from the score",
+  )
+  .option(
+    "--update-baseline <report>",
+    "Write the scan's JSON report to this path for use with --baseline",
+  )
+  .action(async (path: string, options, command: Command) => {
     const targetPath = resolve(path);
-    const format = options.ci ? "json" : options.format;
+    // --ci implies JSON only when no output format was chosen explicitly.
+    const explicitFormat = command.getOptionValueSource("format") === "cli";
+    const format = options.ci && !explicitFormat ? "json" : options.format;
 
     try {
       if (!OUTPUT_FORMATS.has(format)) {
@@ -91,7 +89,24 @@ program
           : options.ci || hasConfig
             ? config.threshold
             : null;
-      const result = await scan(targetPath, config);
+      const baseline = options.baseline
+        ? loadBaseline(resolve(options.baseline))
+        : undefined;
+      const result = await scan(targetPath, config, {
+        baseline,
+        // --no-audit overrides the config; otherwise the config decides.
+        audit:
+          command.getOptionValueSource("audit") === "cli" ? false : undefined,
+      });
+      if (options.updateBaseline) {
+        const baselinePath = resolve(options.updateBaseline);
+        mkdirSync(dirname(baselinePath), { recursive: true });
+        writeFileSync(
+          baselinePath,
+          `${JSON.stringify(result, null, 2)}\n`,
+          "utf-8",
+        );
+      }
 
       switch (format) {
         case "json":
@@ -136,8 +151,17 @@ program
 program
   .command("init")
   .description("Create a .codediag.yml config file")
-  .action(() => {
-    const configPath = resolve(".codediag.yml");
+  .argument("[path]", "Project directory to configure", ".")
+  .action((path: string) => {
+    const projectPath = resolve(path);
+    if (!existsSync(projectPath)) {
+      console.error(
+        chalk.red("\n  Error:"),
+        `Directory not found: ${projectPath}`,
+      );
+      process.exit(1);
+    }
+    const configPath = resolve(projectPath, ".codediag.yml");
 
     if (existsSync(configPath)) {
       console.log(chalk.yellow("\n  .codediag.yml already exists.\n"));
@@ -148,6 +172,9 @@ program
 # https://github.com/sabahattink/codediag#config
 
 threshold: 70
+
+scoring:
+  version: 2
 
 ignore:
   - node_modules
@@ -161,10 +188,46 @@ analyzers:
   dependencies: true
   testing: true
   structure: true
+
+# Turn rules off or change their severity (rule IDs: docs/rules.md).
+# rules:
+#   missing-swagger: off
+#   open-cors: critical
+
+# Code files larger than this are skipped (KiB).
+# maxFileSizeKb: 512
 `;
 
     writeFileSync(configPath, template, "utf-8");
-    console.log(chalk.green("\n  Created .codediag.yml\n"));
+    console.log(chalk.green(`\n  Created ${configPath}\n`));
+  });
+
+program
+  .command("rules")
+  .description("List every rule with its default severity")
+  .option("--json", "Print rule metadata as JSON")
+  .action((options: { json?: boolean }) => {
+    console.log(options.json ? ruleListJson() : renderRuleList());
+  });
+
+program
+  .command("explain")
+  .description("Explain a rule and how to suppress or reconfigure it")
+  .argument("<rule>", "Rule ID, for example dynamic-sql-query")
+  .action((rule: string) => {
+    const explanation = renderRuleExplanation(rule);
+    if (explanation) {
+      console.log(explanation);
+      return;
+    }
+    const suggestions = suggestRules(rule);
+    console.error(
+      chalk.red("\n  Error:"),
+      `Unknown rule "${rule}".${
+        suggestions.length > 0 ? ` Did you mean ${suggestions.join(", ")}?` : ""
+      } Run codediag rules to list them.\n`,
+    );
+    process.exitCode = 1;
   });
 
 program.parse();
