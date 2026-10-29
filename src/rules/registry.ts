@@ -47,6 +47,7 @@ const OWASP = {
   misconfiguration: "A05:2021",
   vulnerableComponents: "A06:2021",
   authentication: "A07:2021",
+  integrity: "A08:2021",
   requestForgery: "A10:2021",
 } as const;
 
@@ -143,6 +144,41 @@ export const RULES = {
     defaultSeverity: "warning",
     cwe: ["CWE-209"],
   },
+  // API Health: Fastify
+  "no-fastify-routes": {
+    analyzer: "API Health",
+    title: "No Fastify routes",
+    description:
+      "The project depends on Fastify but no route registrations with a literal path were detected.",
+    defaultSeverity: "critical",
+    failsAnalyzer: true,
+  },
+  "missing-auth-hook": {
+    analyzer: "API Health",
+    title: "Mutating route without auth hook",
+    description:
+      "A POST, PUT, PATCH, or DELETE route has no recognizable authentication hook (onRequest, preParsing, preValidation, or preHandler) in its route options, in addHook() calls of its plugin or of fastify-plugin plugins sharing that context, or inherited from every place the plugin is registered.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "missing-route-schema": {
+    analyzer: "API Health",
+    title: "Route without body schema",
+    description:
+      "A POST, PUT, or PATCH route declares no schema.body (JSON Schema, TypeBox, or a Zod type provider schema) and no recognizable validation hook, so Fastify does not validate the request body.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
+  "missing-error-handler": {
+    analyzer: "API Health",
+    title: "No custom error handler",
+    description:
+      "No setErrorHandler() call was found, so Fastify's default handler replies with the message of every error, including unexpected 500 errors.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-209"],
+  },
   // API Health: Next.js
   "no-nextjs-handlers": {
     analyzer: "API Health",
@@ -209,10 +245,20 @@ export const RULES = {
     analyzer: "Security",
     title: "Hardcoded secret",
     description:
-      "Source code contains a value that matches a credential pattern such as an API key, password, or provider token.",
+      "Source code or a configuration file (JSON, YAML, TOML, INI, XML, properties, Dockerfile, or .npmrc) contains a value that matches a credential pattern such as an API key, password, or provider token. In configuration files, keys such as `password` or `clientSecret` are reported only for long, high-entropy values that are not placeholders or environment variable references. Findings never include the value itself.",
     defaultSeverity: "critical",
     cwe: ["CWE-798"],
     owasp: [OWASP.authentication],
+    sensitiveSource: true,
+  },
+  "committed-env-secret": {
+    analyzer: "Security",
+    title: "Secret in a committed .env file",
+    description:
+      "A .env file tracked by Git contains a provider token or a long, high-entropy value for a secret-like key. Ignoring the file afterwards does not remove it from history: rotate the secret, then untrack the file with `git rm --cached`.",
+    defaultSeverity: "critical",
+    cwe: ["CWE-538", "CWE-798"],
+    owasp: [OWASP.misconfiguration],
     sensitiveSource: true,
   },
   "weak-password-hash": {
@@ -255,7 +301,7 @@ export const RULES = {
     analyzer: "Security",
     title: "Dynamic shell command",
     description:
-      "A shell is invoked through exec or execSync with a non-literal command. The finding is critical when the command comes from request data, directly or through up to three variable assignments.",
+      "A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly or through up to three variable assignments.",
     defaultSeverity: "warning",
     cwe: ["CWE-78"],
     owasp: [OWASP.injection],
@@ -296,6 +342,24 @@ export const RULES = {
     cwe: ["CWE-79"],
     owasp: [OWASP.injection],
   },
+  "server-side-template-injection": {
+    analyzer: "Security",
+    title: "Template compiled from request data",
+    description:
+      "EJS, Pug, Handlebars, Nunjucks, Eta, doT, or lodash compiles or renders a template whose source comes from request data. Template languages can run code on the server, so the caller controls what executes. Passing request data as template variables is not reported.",
+    defaultSeverity: "critical",
+    cwe: ["CWE-1336", "CWE-94"],
+    owasp: [OWASP.injection],
+  },
+  "prototype-pollution": {
+    analyzer: "Security",
+    title: "Prototype pollution",
+    description:
+      "A nested write such as `target[a][b] = value` uses a key from request data, or a recursive merge copies keys without rejecting `__proto__`, `constructor`, and `prototype`. A key of `__proto__` then changes Object.prototype for the whole process. Nested writes from request data are critical; unguarded recursive merges are warnings. Current versions of lodash and deepmerge guard these keys and are not reported.",
+    defaultSeverity: "critical",
+    cwe: ["CWE-1321"],
+    owasp: [OWASP.integrity],
+  },
   "dynamic-sql-query": {
     analyzer: "Security",
     title: "Dynamically built SQL query",
@@ -313,6 +377,33 @@ export const RULES = {
     defaultSeverity: "critical",
     cwe: ["CWE-295"],
     owasp: [OWASP.authentication],
+  },
+  "jwt-none-algorithm": {
+    analyzer: "Security",
+    title: "JWT accepts the none algorithm",
+    description:
+      "JWT options list `none` in `algorithms` or set `algorithm: 'none'`, or jose's UnsecuredJWT is used, so tokens without a signature are created or accepted and anyone can forge one.",
+    defaultSeverity: "critical",
+    cwe: ["CWE-347"],
+    owasp: [OWASP.cryptographic],
+  },
+  "jwt-expiration-ignored": {
+    analyzer: "Security",
+    title: "JWT expiration ignored",
+    description:
+      "JWT verification sets `ignoreExpiration: true` (jsonwebtoken, passport-jwt, @nestjs/jwt), so a stolen token stays valid forever.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-613"],
+    owasp: [OWASP.authentication],
+  },
+  "insecure-cookie": {
+    analyzer: "Security",
+    title: "Session cookie without httpOnly or secure",
+    description:
+      "A cookie whose name suggests a session or token (session, sid, token, jwt, auth) is set with res.cookie(), reply.setCookie(), or cookies().set() without `httpOnly: true` and `secure: true`, or session middleware (express-session, cookie-session, @fastify/session) sets `httpOnly: false` or `secure: false`. Scripts can then read the cookie, or it is sent over plain HTTP. Non-literal values such as `secure: isProduction` count as set.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-1004", "CWE-614"],
+    owasp: [OWASP.misconfiguration],
   },
   "no-helmet": {
     analyzer: "Security",
