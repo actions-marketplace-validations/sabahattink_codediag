@@ -4,6 +4,7 @@ import chalk from "chalk";
 import ora from "ora";
 import { analyzeDependencies } from "./analyzers/dependencies.js";
 import { analyzeExpressApi } from "./analyzers/express-api.js";
+import { analyzeFastifyApi } from "./analyzers/fastify-api.js";
 import { analyzeNestjsApi } from "./analyzers/nestjs-api.js";
 import { analyzeNextjsApi } from "./analyzers/nextjs-api.js";
 import { analyzeSecurity } from "./analyzers/security.js";
@@ -11,10 +12,15 @@ import { analyzeStructure } from "./analyzers/structure.js";
 import { analyzeTesting } from "./analyzers/testing.js";
 import { loadConfig } from "./config.js";
 import { applyBaseline } from "./core/baseline.js";
+import { limitToFiles } from "./core/changed-files.js";
 import { assignFingerprints } from "./core/fingerprint.js";
 import { applyRuleOverrides } from "./core/rule-overrides.js";
-import { createScanContext } from "./core/scan-context.js";
-import { applyScoring } from "./core/scoring.js";
+import { createScanContext, type ScanContext } from "./core/scan-context.js";
+import {
+  ANALYZER_WEIGHTS,
+  applyScoring,
+  DEFAULT_ANALYZER_WEIGHT,
+} from "./core/scoring.js";
 import { applySuppressions } from "./core/suppressions.js";
 import { detectStack } from "./detectors/stack-detector.js";
 import type {
@@ -22,14 +28,20 @@ import type {
   CodediagConfig,
   Grade,
   ScanResult,
+  StackInfo,
 } from "./types.js";
 
-const WEIGHTS: Record<string, number> = {
-  "API Health": 25,
-  Security: 30,
-  Dependencies: 20,
-  Testing: 15,
-  Structure: 10,
+/** API Health analyzers by detected framework; other stacks skip it. */
+const API_ANALYZERS: Partial<
+  Record<
+    StackInfo["framework"],
+    (context: ScanContext) => Promise<AnalyzerResult | null>
+  >
+> = {
+  nestjs: analyzeNestjsApi,
+  express: analyzeExpressApi,
+  fastify: analyzeFastifyApi,
+  nextjs: analyzeNextjsApi,
 };
 
 export interface ScanOptions {
@@ -42,6 +54,11 @@ export interface ScanOptions {
    * "cached" reuses this process's earlier audit of the same lock file.
    */
   audit?: boolean | "cached";
+  /**
+   * Reports and scores only findings in these project-relative files,
+   * typically from changedFilesSince().
+   */
+  scope?: { changedSince: string; files: ReadonlySet<string> };
 }
 
 interface ProgressReporter {
@@ -103,19 +120,10 @@ export async function scan(
   const context = createScanContext(projectPath, config, { stack });
 
   // Framework-specific API health
-  if (
-    config.analyzers.api &&
-    (stack.framework === "nestjs" ||
-      stack.framework === "express" ||
-      stack.framework === "nextjs")
-  ) {
+  const analyzeApi = API_ANALYZERS[stack.framework];
+  if (config.analyzers.api && analyzeApi) {
     progress.start("Analyzing API health...");
-    const r =
-      stack.framework === "nestjs"
-        ? await analyzeNestjsApi(context)
-        : stack.framework === "express"
-          ? await analyzeExpressApi(context)
-          : await analyzeNextjsApi(context);
+    const r = await analyzeApi(context);
     if (r) {
       results.push(r);
       progress.succeed(`API Health: ${findingCount(r)}`);
@@ -163,11 +171,15 @@ export async function scan(
     config.rules,
   );
   const fingerprinted = assignFingerprints(configured, context.readText);
+  const scoped = options.scope
+    ? limitToFiles(fingerprinted, options.scope.files)
+    : undefined;
+  const inScope = scoped?.results ?? fingerprinted;
   const baseline = options.baseline
-    ? applyBaseline(fingerprinted, options.baseline)
+    ? applyBaseline(inScope, options.baseline)
     : undefined;
   const analyzers = applyScoring(
-    baseline?.results ?? fingerprinted,
+    baseline?.results ?? inScope,
     config.scoring.version,
     config.rules,
   );
@@ -176,7 +188,7 @@ export async function scan(
   let totalWeight = 0;
   let weightedSum = 0;
   for (const r of analyzers) {
-    const w = WEIGHTS[r.name] || 10;
+    const w = ANALYZER_WEIGHTS[r.name] ?? DEFAULT_ANALYZER_WEIGHT;
     weightedSum += r.score * w;
     totalWeight += w;
   }
@@ -196,5 +208,14 @@ export async function scan(
     scoringVersion: config.scoring.version,
     ...(baseline ? { baseline: baseline.summary } : {}),
     ...(skipped.total > 0 ? { skipped } : {}),
+    ...(options.scope && scoped
+      ? {
+          scope: {
+            changedSince: options.scope.changedSince,
+            files: options.scope.files.size,
+            excludedFindings: scoped.excluded,
+          },
+        }
+      : {}),
   };
 }
