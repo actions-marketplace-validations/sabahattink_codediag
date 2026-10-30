@@ -34,6 +34,11 @@ export interface RuleDefinition {
    * count (more vulnerabilities) is a new finding for baselines.
    */
   countsAreIdentity?: boolean;
+  /**
+   * Findings in a file without a line are told apart by their message (such
+   * as the commit it names), so fingerprints include it.
+   */
+  messageIsIdentity?: boolean;
 }
 
 export const RULES_DOCUMENT_URL =
@@ -179,6 +184,68 @@ export const RULES = {
     defaultSeverity: "warning",
     cwe: ["CWE-209"],
   },
+  // API Health: Hono
+  "no-hono-routes": {
+    analyzer: "API Health",
+    title: "No Hono routes",
+    description:
+      "The project depends on Hono but no route registrations with a literal path were detected.",
+    defaultSeverity: "critical",
+    failsAnalyzer: true,
+  },
+  "missing-hono-auth-middleware": {
+    analyzer: "API Health",
+    title: "Mutating Hono route without auth middleware",
+    description:
+      "A POST, PUT, PATCH, or DELETE route has no recognizable authentication middleware (such as jwt(), bearerAuth(), basicAuth(), or a createRoute() middleware) in its own handlers or in an app.use() whose path matches the route and that is registered before it on the same app or on every app that mounts it with app.route(). Hono runs middleware in registration order, so app.use() after the route does not protect it.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "missing-hono-validator": {
+    analyzer: "API Health",
+    title: "Hono route without body validator",
+    description:
+      "A POST, PUT, or PATCH route has no validator for the json or form target (zValidator, vValidator, tbValidator, sValidator, arktypeValidator, or validator() from hono/validator) and no @hono/zod-openapi request body, so the handler reads an unvalidated request body. Validators for param, query, header, or cookie do not count.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
+  "missing-hono-error-handler": {
+    analyzer: "API Health",
+    title: "No Hono error handler",
+    description:
+      "No app.onError() handler was found. Hono's default handler logs the error and replies with a plain-text 500, so clients get a response that does not match the API's error format and errors reach no logger or error tracker beyond the console.",
+    defaultSeverity: "info",
+  },
+  // API Health: tRPC
+  "missing-trpc-auth-middleware": {
+    analyzer: "API Health",
+    title: "tRPC mutation without auth middleware",
+    description:
+      "A tRPC mutation is built on a procedure whose .use() middleware chain has no recognizable authentication: no middleware throws a TRPCError with code UNAUTHORIZED or FORBIDDEN, throws when ctx.session, ctx.user, or ctx.auth is missing, or is named like an auth check. Builders are followed through variables and imports to t.procedure, so a builder named protectedProcedure is judged by its middleware, and a .use() whose result is discarded protects nothing, because builders are immutable. Queries and subscriptions are not reported. Findings about builders or middleware imported from packages rely on names and have low confidence.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "unvalidated-trpc-input": {
+    analyzer: "API Health",
+    title: "tRPC input without validation",
+    description:
+      "A tRPC procedure's .input() parser accepts every value: z.any(), z.unknown(), or z.custom() without a check (also when optional, nullable, or defaulted), Valibot's any() or unknown(), or a parser function that only returns its argument, such as (value) => value as Input. The resolver's input is typed but never checked.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
+  "trpc-stack-trace-exposed": {
+    analyzer: "API Health",
+    title: "tRPC errors expose stack traces",
+    description:
+      "The initTRPC instance is created with isDev: true, or with an errorFormatter that returns error.stack outside a condition, so error responses carry server stack traces in production. Without them, tRPC adds the stack only when NODE_ENV is not production.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-209"],
+    owasp: [OWASP.misconfiguration],
+  },
   // API Health: Next.js
   "no-nextjs-handlers": {
     analyzer: "API Health",
@@ -261,6 +328,23 @@ export const RULES = {
     owasp: [OWASP.misconfiguration],
     sensitiveSource: true,
   },
+  "secret-in-git-history": {
+    analyzer: "Security",
+    title: "Secret in Git history",
+    description:
+      "A commit on the checked-out branch added a credential that is no longer in the current tree, but every clone and fork still contains it. Only scanned with `secretHistory` in .codediag.yml or `--secret-history`: added lines of recent commits are checked for provider formats (private keys, AWS, GitHub, Stripe, Slack, npm, Google, Anthropic, OpenAI, SendGrid, database URLs with a password) and, in configuration and .env files, long random values of secret-like keys. Secrets still in the current tree are left to the other secret rules. Rotate or revoke the credential; rewriting history does not revoke it. Findings never include the value.",
+    defaultSeverity: "critical",
+    cwe: ["CWE-798", "CWE-312"],
+    owasp: [OWASP.authentication],
+    messageIsIdentity: true,
+  },
+  "secret-history-incomplete": {
+    analyzer: "Security",
+    title: "Git history scan incomplete",
+    description:
+      "The Git history scan for removed secrets stopped at its output size or time limit, so older commits were not checked. The findings it reports cover the commits it read.",
+    defaultSeverity: "info",
+  },
   "weak-password-hash": {
     analyzer: "Security",
     title: "Weak password hash",
@@ -301,7 +385,7 @@ export const RULES = {
     analyzer: "Security",
     title: "Dynamic shell command",
     description:
-      "A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly or through up to three variable assignments.",
+      "A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep, such as a route passing `req.body.cmd` to `run(cmd)`; findings that depend on such a call have medium confidence.",
     defaultSeverity: "warning",
     cwe: ["CWE-78"],
     owasp: [OWASP.injection],
@@ -310,7 +394,7 @@ export const RULES = {
     analyzer: "Security",
     title: "File path from request data",
     description:
-      "A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Values passed through path.basename() or checked with startsWith() in the same function are not reported.",
+      "A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Request data is also followed into project helper functions and services up to two calls deep (medium confidence). Values passed through path.basename() or checked with startsWith() in the same function are not reported.",
     defaultSeverity: "critical",
     cwe: ["CWE-22"],
     owasp: [OWASP.accessControl],
@@ -364,7 +448,7 @@ export const RULES = {
     analyzer: "Security",
     title: "Dynamically built SQL query",
     description:
-      "A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly or through up to three variable assignments; queries built from request data are reported for any client variable name.",
+      "A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep (medium confidence); queries built from request data are reported for any client variable name.",
     defaultSeverity: "warning",
     cwe: ["CWE-89"],
     owasp: [OWASP.injection],

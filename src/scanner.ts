@@ -5,22 +5,24 @@ import ora from "ora";
 import { analyzeDependencies } from "./analyzers/dependencies.js";
 import { analyzeExpressApi } from "./analyzers/express-api.js";
 import { analyzeFastifyApi } from "./analyzers/fastify-api.js";
+import { analyzeHonoApi } from "./analyzers/hono-api.js";
 import { analyzeNestjsApi } from "./analyzers/nestjs-api.js";
 import { analyzeNextjsApi } from "./analyzers/nextjs-api.js";
 import { analyzeSecurity } from "./analyzers/security.js";
 import { analyzeStructure } from "./analyzers/structure.js";
 import { analyzeTesting } from "./analyzers/testing.js";
+import {
+  type ApiAnalyzer,
+  analyzeTrpcApi,
+  withTrpcProcedures,
+} from "./analyzers/trpc-api.js";
 import { loadConfig } from "./config.js";
 import { applyBaseline } from "./core/baseline.js";
 import { limitToFiles } from "./core/changed-files.js";
 import { assignFingerprints } from "./core/fingerprint.js";
 import { applyRuleOverrides } from "./core/rule-overrides.js";
-import { createScanContext, type ScanContext } from "./core/scan-context.js";
-import {
-  ANALYZER_WEIGHTS,
-  applyScoring,
-  DEFAULT_ANALYZER_WEIGHT,
-} from "./core/scoring.js";
+import { createScanContext } from "./core/scan-context.js";
+import { applyScoring, weightedTotal } from "./core/scoring.js";
 import { applySuppressions } from "./core/suppressions.js";
 import { detectStack } from "./detectors/stack-detector.js";
 import type {
@@ -31,17 +33,18 @@ import type {
   StackInfo,
 } from "./types.js";
 
-/** API Health analyzers by detected framework; other stacks skip it. */
-const API_ANALYZERS: Partial<
-  Record<
-    StackInfo["framework"],
-    (context: ScanContext) => Promise<AnalyzerResult | null>
-  >
-> = {
-  nestjs: analyzeNestjsApi,
-  express: analyzeExpressApi,
-  fastify: analyzeFastifyApi,
-  nextjs: analyzeNextjsApi,
+/**
+ * API Health analyzers by detected framework; other stacks skip it. tRPC
+ * procedures are endpoints of whichever server mounts them, so each server's
+ * analyzer also checks the project's tRPC procedures.
+ */
+const API_ANALYZERS: Partial<Record<StackInfo["framework"], ApiAnalyzer>> = {
+  nestjs: withTrpcProcedures(analyzeNestjsApi),
+  express: withTrpcProcedures(analyzeExpressApi),
+  fastify: withTrpcProcedures(analyzeFastifyApi),
+  hono: withTrpcProcedures(analyzeHonoApi),
+  nextjs: withTrpcProcedures(analyzeNextjsApi),
+  trpc: analyzeTrpcApi,
 };
 
 export interface ScanOptions {
@@ -55,10 +58,22 @@ export interface ScanOptions {
    */
   audit?: boolean | "cached";
   /**
+   * Overrides the `secretHistory` config setting: the number of recent
+   * commits searched for removed secrets, or false to skip Git history.
+   */
+  secretHistory?: false | number;
+  /**
    * Reports and scores only findings in these project-relative files,
    * typically from changedFilesSince().
    */
   scope?: { changedSince: string; files: ReadonlySet<string> };
+  /**
+   * The project's path inside a workspace, mixed into fingerprints so that
+   * findings stay distinct when package reports are combined.
+   */
+  fingerprintNamespace?: string;
+  /** Shown before each progress message, such as a workspace package path. */
+  label?: string;
 }
 
 interface ProgressReporter {
@@ -68,15 +83,17 @@ interface ProgressReporter {
 
 function createProgressReporter(options: ScanOptions): ProgressReporter {
   const spinner = options.interactive === false ? null : ora({ color: "cyan" });
+  const label = (message: string) =>
+    options.label ? `${options.label}: ${message}` : message;
 
   return {
     start(message) {
-      options.onProgress?.(message);
-      spinner?.start(chalk.dim(message));
+      options.onProgress?.(label(message));
+      spinner?.start(chalk.dim(label(message)));
     },
     succeed(message) {
-      options.onProgress?.(message);
-      spinner?.succeed(chalk.dim(message));
+      options.onProgress?.(label(message));
+      spinner?.succeed(chalk.dim(label(message)));
     },
   };
 }
@@ -87,7 +104,7 @@ function findingCount(result: AnalyzerResult): string {
   return `${count} finding${count === 1 ? "" : "s"}`;
 }
 
-function calculateGrade(score: number): Grade {
+export function calculateGrade(score: number): Grade {
   if (score >= 95) return "A+";
   if (score >= 90) return "A";
   if (score >= 85) return "B+";
@@ -135,7 +152,9 @@ export async function scan(
   // Security
   if (config.analyzers.security) {
     progress.start("Scanning security...");
-    const sec = await analyzeSecurity(context);
+    const sec = await analyzeSecurity(context, {
+      secretHistory: options.secretHistory,
+    });
     results.push(sec);
     progress.succeed(`Security: ${findingCount(sec)}`);
   }
@@ -170,7 +189,11 @@ export async function scan(
     applySuppressions(results, context),
     config.rules,
   );
-  const fingerprinted = assignFingerprints(configured, context.readText);
+  const fingerprinted = assignFingerprints(
+    configured,
+    context.readText,
+    options.fingerprintNamespace,
+  );
   const scoped = options.scope
     ? limitToFiles(fingerprinted, options.scope.files)
     : undefined;
@@ -184,17 +207,7 @@ export async function scan(
     config.rules,
   );
 
-  // Calculate total
-  let totalWeight = 0;
-  let weightedSum = 0;
-  for (const r of analyzers) {
-    const w = ANALYZER_WEIGHTS[r.name] ?? DEFAULT_ANALYZER_WEIGHT;
-    weightedSum += r.score * w;
-    totalWeight += w;
-  }
-
-  const totalScore =
-    totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
+  const totalScore = weightedTotal(analyzers);
   const grade = calculateGrade(totalScore);
   const skipped = context.skipped();
 

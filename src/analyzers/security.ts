@@ -3,6 +3,7 @@ import { dirname, join, relative } from "node:path";
 import type { ScanContext } from "../core/scan-context.js";
 import { fromRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue } from "../types.js";
+import { scanSecretHistory } from "./secret-history.js";
 import { findConfigSecrets } from "./secrets.js";
 import { analyzeSecuritySinks } from "./security-sinks.js";
 
@@ -177,6 +178,41 @@ function importedDefaultBindings(
   return bindings;
 }
 
+/**
+ * Local names for one named export: `import { cors as c } from "hono/cors"`
+ * or `const { cors } = require("hono/cors")`.
+ */
+function importedNamedBindings(
+  content: string,
+  moduleName: string,
+  exportName: string,
+): Set<string> {
+  const bindings = new Set<string>();
+  const modulePattern = escapeRegExp(moduleName);
+  const lists = [
+    new RegExp(
+      `\\bimport\\s*(?:[A-Za-z_$][\\w$]*\\s*,\\s*)?\\{([^}]*)\\}\\s*from\\s*['"]${modulePattern}['"]`,
+      "g",
+    ),
+    new RegExp(
+      `\\b(?:const|let|var)\\s*\\{([^}]*)\\}\\s*=\\s*require\\(\\s*['"]${modulePattern}['"]\\s*\\)`,
+      "g",
+    ),
+  ];
+  for (const pattern of lists) {
+    for (const match of content.matchAll(pattern)) {
+      for (const entry of (match[1] ?? "").split(",")) {
+        const [imported, local] = entry
+          .trim()
+          .replace(/^type\s+/, "")
+          .split(/\s+as\s+|\s*:\s*/);
+        if (imported === exportName) bindings.add(local ?? imported);
+      }
+    }
+  }
+  return bindings;
+}
+
 function bindingIsCalled(content: string, binding: string): boolean {
   const name = escapeRegExp(binding);
   return new RegExp(`\\b${name}\\s*\\(`).test(content);
@@ -193,8 +229,13 @@ function hasHelmetUsage(sources: SourceRecord[]): boolean {
     const fastifyBindings = importedDefaultBindings(content, [
       "@fastify/helmet",
     ]);
+    const honoBindings = importedNamedBindings(
+      content,
+      "hono/secure-headers",
+      "secureHeaders",
+    );
     return (
-      [...helmetBindings].some((binding) =>
+      [...helmetBindings, ...honoBindings].some((binding) =>
         bindingIsCalled(content, binding),
       ) ||
       [...fastifyBindings].some((binding) =>
@@ -222,8 +263,13 @@ function hasRateLimitUsage(sources: SourceRecord[]): boolean {
     const fastifyBindings = importedDefaultBindings(content, [
       "@fastify/rate-limit",
     ]);
+    const honoBindings = importedNamedBindings(
+      content,
+      "hono-rate-limiter",
+      "rateLimiter",
+    );
     return (
-      [...factoryBindings].some((binding) =>
+      [...factoryBindings, ...honoBindings].some((binding) =>
         bindingIsCalled(content, binding),
       ) ||
       [...fastifyBindings].some((binding) =>
@@ -241,9 +287,10 @@ function findOpenCors(
       /\benableCors\s*\(\s*\)/,
       /\benableCors\s*\(\s*\{[\s\S]{0,800}?\borigin\s*:\s*(?:true|['"]\*['"])/,
     ];
-    const corsBindings = importedDefaultBindings(source.content, [
-      "cors",
-      "@fastify/cors",
+    // Hono's cors() allows every origin when no origin option is given.
+    const corsBindings = new Set([
+      ...importedDefaultBindings(source.content, ["cors", "@fastify/cors"]),
+      ...importedNamedBindings(source.content, "hono/cors", "cors"),
     ]);
     for (const binding of corsBindings) {
       const name = escapeRegExp(binding);
@@ -342,8 +389,17 @@ function readSources(context: ScanContext): {
   return { allSources, runtimeSources };
 }
 
+export interface SecurityOptions {
+  /**
+   * Overrides the `secretHistory` config setting: a number of commits to
+   * search, or false to leave Git history alone.
+   */
+  secretHistory?: false | number;
+}
+
 export async function analyzeSecurity(
   context: ScanContext,
+  options: SecurityOptions = {},
 ): Promise<AnalyzerResult> {
   const { projectPath } = context;
   const issues: DiagnosticIssue[] = [];
@@ -359,6 +415,7 @@ export async function analyzeSecurity(
     "@nestjs/core",
     "express",
     "fastify",
+    "hono",
     "koa",
     "@hapi/hapi",
   ].some((name) => name in dependencies);
@@ -424,6 +481,22 @@ export async function analyzeSecurity(
   issues.push(...configSecrets);
   if (!secretsFound && configSecrets.length === 0) checksPassed++;
 
+  // Opt-in: results depend on clone depth, so they would make local and CI
+  // baselines differ.
+  const secretHistory = options.secretHistory ?? context.config.secretHistory;
+  let historyNote: string | undefined;
+  if (secretHistory !== false) {
+    const history = scanSecretHistory(context, secretHistory);
+    if (history.scanned) {
+      checksRun++;
+      if (!history.issues.some((issue) => issue.severity !== "info")) {
+        checksPassed++;
+      }
+    }
+    issues.push(...history.issues);
+    historyNote = history.note;
+  }
+
   const detectedPasswordIssues = passwordIssues(runtimeSources);
   if (
     detectedPasswordIssues.length > 0 ||
@@ -484,6 +557,6 @@ export async function analyzeSecurity(
     name: "Security",
     score,
     issues,
-    summary: `${checksPassed}/${checksRun} checks passed`,
+    summary: `${checksPassed}/${checksRun} checks passed${historyNote ? `; ${historyNote}` : ""}`,
   };
 }

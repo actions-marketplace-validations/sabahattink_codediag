@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -499,4 +500,265 @@ test("--changed-since cannot rewrite a whole-project baseline", () => {
   ]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /cannot be combined with --changed-since/);
+});
+
+test("--workspaces scans each package and combines the reports", () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-cli-"));
+  try {
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+    );
+    writeFileSync(join(directory, ".gitignore"), ".env\n");
+    for (const name of ["api", "web"]) {
+      mkdirSync(join(directory, "packages", name, "src"), { recursive: true });
+      writeFileSync(
+        join(directory, "packages", name, "package.json"),
+        JSON.stringify({ name: `@acme/${name}` }),
+      );
+      writeFileSync(
+        join(directory, "packages", name, "src", "index.js"),
+        name === "api" ? "eval(input);\n" : "export const ok = 1;\n",
+      );
+    }
+
+    const combined = runCli(
+      ["scan", ".", "--workspaces", "--format", "json", "--no-audit"],
+      directory,
+    );
+    assert.equal(combined.status, 0, combined.stderr);
+    const report = JSON.parse(combined.stdout);
+    assert.equal(validateScanResult(report), true);
+    assert.deepEqual(
+      report.workspace.packages.map((entry) => entry.path),
+      ["packages/api", "packages/web"],
+    );
+    const security = report.analyzers.find((a) => a.name === "Security");
+    assert.ok(
+      security.issues.some(
+        (issue) =>
+          issue.rule === "unsafe-dynamic-code" &&
+          issue.file === "packages/api/src/index.js",
+      ),
+    );
+
+    const hint = runCli(["scan", ".", "--no-audit"], directory);
+    assert.match(
+      hint.stdout,
+      /npm workspace with 2 packages; add --workspaces to scan each one/,
+    );
+
+    const terminal = runCli(
+      ["scan", ".", "--workspaces", "--no-audit"],
+      directory,
+    );
+    assert.match(terminal.stdout, /Packages \(npm workspace, 2\)/);
+    assert.match(terminal.stdout, /packages\/api .* \d+ /);
+
+    const single = runCli(["scan", "packages/web", "--workspaces"], directory);
+    assert.equal(single.status, 1);
+    assert.match(single.stderr, /No workspace packages found/);
+
+    // The api package's eval() puts it below the web package; gate between.
+    const [api, web] = report.workspace.packages.map(
+      (entry) => entry.totalScore,
+    );
+    assert.ok(api < web);
+    const gated = runCli(
+      [
+        "scan",
+        ".",
+        "--workspaces",
+        "--package-threshold",
+        String(web),
+        "--threshold",
+        "0",
+        "--no-audit",
+      ],
+      directory,
+    );
+    assert.equal(gated.status, 1);
+    assert.equal(
+      gated.stderr.match(/below its package threshold/g)?.length,
+      1,
+      gated.stderr,
+    );
+    assert.match(
+      gated.stderr,
+      new RegExp(
+        `packages/api scored ${api}, below its package threshold ${web}`,
+      ),
+    );
+    assert.match(gated.stdout, new RegExp(`packages/api .* below ${web}`));
+
+    const notWorkspace = runCli(
+      ["scan", ".", "--package-threshold", "50", "--no-audit"],
+      directory,
+    );
+    assert.equal(notWorkspace.status, 1);
+    assert.match(notWorkspace.stderr, /--package-threshold needs --workspaces/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("--history records each scan and reports the trend", () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-cli-"));
+  try {
+    writeFileSync(join(directory, "package.json"), "{}");
+    writeFileSync(join(directory, ".gitignore"), ".env\n");
+    writeFileSync(join(directory, "run.js"), "eval(a);\n");
+
+    const first = runCli(
+      ["scan", ".", "--no-audit", "--history", "history"],
+      directory,
+    );
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stdout, /Trend: +first recorded scan/);
+
+    writeFileSync(join(directory, "run.js"), "export const ok = 1;\n");
+    const second = runCli(
+      ["scan", ".", "--no-audit", "--history", "history", "--format", "json"],
+      directory,
+    );
+    const report = JSON.parse(second.stdout);
+    assert.equal(validateScanResult(report), true);
+    assert.equal(report.history.length, 2);
+    assert.ok(report.history[1].totalScore > report.history[0].totalScore);
+    assert.equal(readdirSync(join(directory, "history")).length, 2);
+
+    const scoped = runCli(
+      ["scan", ".", "--history", "history", "--changed-since", "HEAD"],
+      directory,
+    );
+    assert.equal(scoped.status, 1);
+    assert.match(scoped.stderr, /cannot be combined with --changed-since/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("--fail-on fails on active findings at or above a severity", () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-cli-"));
+  try {
+    writeFileSync(join(directory, "package.json"), "{}");
+    writeFileSync(join(directory, ".gitignore"), ".env\n");
+    writeFileSync(join(directory, "run.js"), "eval(a);\n");
+    const securityOnly = [
+      "analyzers:",
+      "  api: false",
+      "  dependencies: false",
+      "  testing: false",
+      "  structure: false",
+    ];
+    writeFileSync(join(directory, ".codediag.yml"), securityOnly.join("\n"));
+    const scan = (...args) =>
+      runCli(
+        ["scan", ".", "--threshold", "0", "--no-audit", ...args],
+        directory,
+      );
+
+    const passing = scan("--quiet");
+    assert.equal(passing.status, 0, "the threshold alone passes");
+
+    const failing = scan("--fail-on", "critical", "--format", "json");
+    assert.equal(failing.status, 1);
+    assert.match(
+      failing.stderr,
+      /1 active finding at or above critical severity \(fail-on: critical\)/,
+    );
+    assert.equal(JSON.parse(failing.stdout).totalScore > 0, true);
+
+    // A justified suppression removes the finding from the gate.
+    writeFileSync(
+      join(directory, "run.js"),
+      "// codediag-ignore-next-line unsafe-dynamic-code -- input is a constant\neval(a);\n",
+    );
+    assert.equal(scan("--fail-on", "critical", "--quiet").status, 0);
+
+    writeFileSync(join(directory, "run.js"), "eval(a);\n");
+    writeFileSync(
+      join(directory, ".codediag.yml"),
+      ["failOn: warning", ...securityOnly].join("\n"),
+    );
+    const configured = scan("--quiet");
+    assert.equal(configured.status, 1);
+    assert.match(
+      configured.stderr,
+      /1 active finding at or above warning severity \(fail-on: warning\)/,
+    );
+
+    const invalid = scan("--fail-on", "high");
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /fail-on must be critical, warning, or info/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+/** A repository whose first commit adds an AWS key and second removes it. */
+function commitRemovedSecret(directory) {
+  const git = (...args) =>
+    spawnSync("git", args, { cwd: directory, encoding: "utf-8" });
+  git("init", "-q");
+  git("config", "user.name", "CodeDiag");
+  git("config", "user.email", "codediag@example.com");
+  git("config", "commit.gpgsign", "false");
+  writeFileSync(join(directory, "package.json"), "{}");
+  writeFileSync(join(directory, ".gitignore"), ".env\n");
+  // Assembled at runtime so this file does not contain a token pattern.
+  const key = ["AKIA", "IOSFODNN7", "EXAMPLF"].join("");
+  writeFileSync(join(directory, "settings.yml"), `key: ${key}\n`);
+  git("add", "-A");
+  git("commit", "-q", "-m", "add settings");
+  rmSync(join(directory, "settings.yml"));
+  git("add", "-A");
+  git("commit", "-q", "-m", "remove settings");
+  return key;
+}
+
+test("--secret-history reports secrets removed from the current tree", () => {
+  const directory = mkdtempSync(join(tmpdir(), "codediag-cli-"));
+  try {
+    const key = commitRemovedSecret(directory);
+    const historyFindings = (args) => {
+      const result = runCli(
+        ["scan", ".", "--format", "json", "--no-audit", ...args],
+        directory,
+      );
+      assert.equal(result.status, 0, result.stderr);
+      const report = JSON.parse(result.stdout);
+      assert.equal(validateScanResult(report), true);
+      assert.ok(!result.stdout.includes(key));
+      const security = report.analyzers.find(
+        (analyzer) => analyzer.name === "Security",
+      );
+      return {
+        summary: security.summary,
+        files: security.issues
+          .filter((issue) => issue.rule === "secret-in-git-history")
+          .map((issue) => issue.file),
+      };
+    };
+
+    assert.deepEqual(historyFindings([]).files, []);
+    const enabled = historyFindings(["--secret-history"]);
+    assert.deepEqual(enabled.files, ["settings.yml"]);
+    assert.match(enabled.summary, /Git history: 2 commits scanned$/);
+    const limited = historyFindings(["--secret-history", "1"]);
+    assert.deepEqual(limited.files, []);
+    assert.match(
+      limited.summary,
+      /Git history: the most recent 1 commit scanned$/,
+    );
+
+    const invalid = runCli(["scan", ".", "--secret-history", "0"], directory);
+    assert.equal(invalid.status, 1);
+    assert.match(
+      invalid.stderr,
+      /--secret-history must be a number of commits from 1 to 100000/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+- Run the CodeDiag 0.9 engine: tRPC auth in `createContext`, Express mounts,
+  and Next.js middleware no longer produces missing-auth problems.
+- Scans on save also reuse a dependency audit of the same lock file cached on
+  disk within the last hour, so they keep their audit after VS Code restarts.
+
+## 0.6.0
+
+- Remediation quick fixes, offered as the preferred fix where a rule has one
+  mechanical fix on the flagged line: enable TLS certificate verification,
+  verify JWT expiration, and remove `"none"` from a JWT `algorithms` list.
+- Run the CodeDiag 0.8 engine: tRPC procedures, `@fastify/autoload`, and the
+  deeper cross-file taint tracking.
+
+## 0.5.0
+
+- Scan monorepo roots package by package and combine the results
+  (`codediag.scanWorkspacePackages`, on by default).
+- Run the CodeDiag 0.7 engine: Hono analysis and audit advisory details.
+
 ## 0.4.0
 
 - Run the CodeDiag 0.6 engine: Fastify analysis, JWT, cookie, template

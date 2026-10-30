@@ -51,7 +51,7 @@ codediag auto-detects your stack and runs 5 analyzers. Every finding has a
 stable rule ID ([rule reference](docs/rules.md)), a severity, a location when
 one exists, and a suggested fix.
 
-### API Health `NestJS · Express · Fastify · Next.js`
+### API Health `NestJS · Express · Fastify · Hono · Next.js · tRPC`
 
 AST analysis (ts-morph, not regex) of the routes your app actually exposes.
 
@@ -65,11 +65,30 @@ AST analysis (ts-morph, not regex) of the routes your app actually exposes.
   `router.use()` calls, and `app.use(path, mw, router)` mounts across files;
   centralized error handling and health endpoints.
 - **Fastify:** routes from `fastify.get()` and `fastify.route()`, followed
-  through `register()`-ed plugins and `fastify-plugin` encapsulation;
+  through `register()`-ed plugins, `fastify-plugin` encapsulation, and
+  `@fastify/autoload` directories (directory prefixes, `autoPrefix`, and
+  autohooks, as `fastify-cli` projects use them);
   `onRequest`/`preHandler` auth hooks on the route or its context, body
   schemas on mutating routes, `setErrorHandler`, and health endpoints.
+- **Hono:** routes on `new Hono()` apps, `basePath()`, and sub-apps mounted
+  with `app.route()` across files, replayed in registration order; auth
+  middleware (`jwt()`, `bearerAuth()`, `basicAuth()`, or your own) on the
+  route or an earlier matching `app.use()`; `zValidator` and other body
+  validators; `onError`; and health endpoints.
 - **Next.js:** App Router and Pages Router API handlers, without penalizing
   frontend-only projects.
+- **tRPC:** procedures resolved from `initTRPC` through builder chains,
+  exported builders such as `protectedProcedure`, and nested or merged
+  routers across files (including `~/` path aliases); mutations without auth
+  middleware (judged by what the middleware checks, not its name), `.input()`
+  parsers that accept anything, and error formatters or `isDev: true` that
+  expose stack traces. Auth in front of every procedure counts too: a
+  `createContext` that rejects anonymous callers, auth middleware ahead of
+  the Express mount, or a Next.js `middleware.ts` (`proxy.ts` in Next.js 16)
+  whose matcher covers the tRPC route. The checks run inside whichever server
+  hosts tRPC (T3/Next.js, Express, Fastify), and a standalone tRPC server is
+  its own stack. An intentionally public mutation, such as sign-up, is
+  accepted with a reasoned `codediag-ignore-next-line` directive.
 
 ### Security
 
@@ -77,23 +96,37 @@ Hardcoded credentials, `.env` protection in `.gitignore`, Helmet, rate
 limiting, open CORS, weak password hashing, and direct password comparisons.
 Runtime sinks (`eval`, `new Function`, shell commands, raw SQL, disabled TLS
 verification) are found in the AST, and request data is traced through
-variables, destructuring, and reassignments, so `const cmd = req.query.cmd;
-exec(cmd)` is critical. Request data that reaches a file path, an outgoing
+variables, destructuring, reassignments, and up to two calls into your own
+helper functions and services, so `const cmd = req.query.cmd; exec(cmd)` is
+critical, and so is `run(req.query.cmd)` when `run` calls `exec` in another
+file. Request data is also followed into fields a class stores it in, through
+constructors, into `map`/`forEach` callbacks and `for...of` loops, and to
+NestJS providers behind an interface or injection token. tRPC procedure
+`input` is request data too, even after `.input(schema)` validates it. Request data that reaches a file path, an outgoing
 request's host, a redirect, or an HTML response is reported as path
 traversal, SSRF, an open redirect, or reflected XSS; request data compiled as
 a template or used as an object path is template injection or prototype
 pollution. JWT options that accept `none` or ignore expiration, and session
 cookies without `httpOnly`/`secure`, are flagged too. Secrets are also looked
 for in JSON, YAML, Dockerfiles, `.npmrc`, and `.env` files that Git tracks,
-and no report ever contains the value. See
+and no report ever contains the value. With `--secret-history` (or
+`secretHistory` in `.codediag.yml`), the lines recent commits added are also
+searched for credentials that were committed and later deleted, which every
+clone still contains (`secret-in-git-history`); it is off by default because
+results depend on clone depth. See
 [Security analysis](docs/security-analysis.md).
 
 ### Dependencies
 
 Runs the matching npm, pnpm, Yarn Classic, or Yarn Berry audit (skipped with
-`--no-audit`), checks the lock file and `packageManager` consistency, flags
+`--no-audit`; `audit: production` checks only the dependencies you ship),
+names the affected packages and their advisories in each vulnerability
+finding, checks the lock file and `packageManager` consistency, flags
 deprecated packages, and validates engine specs and essential scripts.
-Monorepo lock files are found up to three parent directories.
+Monorepo lock files are found up to three parent directories. A successful
+audit is kept for an hour in `node_modules/.cache/codediag`, keyed by the lock
+file and `package.json`, so repeated scans reuse it (the Dependencies summary
+says when); delete that directory to force a fresh audit.
 
 ### Testing
 
@@ -148,6 +181,7 @@ codediag scan . --format fixes > codediag-fixes.md     # Review checklist
 codediag scan . --format prompt > codediag-prompt.txt  # Review-only AI handoff
 codediag scan . --ci               # JSON output + exit code
 codediag scan . --threshold 80     # Exit 1 below 80 in any output mode
+codediag scan . --fail-on critical # Exit 1 on any active critical finding
 codediag scan . --quiet            # Score only
 codediag scan . --verbose          # All issues and the score breakdown
 codediag scan . --no-audit         # Offline: skip the package manager audit
@@ -155,6 +189,9 @@ codediag scan . --update-baseline .codediag-baseline.json  # Record accepted fin
 codediag scan . --ci --baseline .codediag-baseline.json    # Fail only on new findings
 codediag scan . --compare previous.json   # Score change, new and fixed findings
 codediag scan . --changed-since origin/main  # Only files this branch changes
+codediag scan . --workspaces              # Every monorepo package, combined
+codediag scan . --history .codediag/history  # Record scans, show the trend
+codediag scan . --secret-history         # Also secrets removed but still in Git history
 codediag rules                     # List every rule
 codediag explain open-cors         # Explain a rule and how to suppress it
 codediag init                      # Create .codediag.yml
@@ -188,6 +225,45 @@ how many findings elsewhere were left out.
 ```bash
 codediag scan . --changed-since origin/main --threshold 90
 ```
+
+`--history <directory>` keeps a trend: each scan is saved in the directory
+(`codediag-<timestamp>.json`), and the report shows the score over the last
+50 recorded scans, as a sparkline in the terminal and Markdown and as a chart
+with a table view in the HTML report. Commit the directory, or cache it in CI,
+to keep the history.
+
+```bash
+codediag scan . --history .codediag/history
+```
+
+### Monorepos
+
+`--workspaces` scans every package of an npm, pnpm, or Yarn workspace, a
+Lerna repository, or an Nx workspace (Turborepo uses your package manager's
+workspaces). Each package gets its own stack detection and score, using its
+own `.codediag.yml` if it has one and otherwise the root configuration, with
+root `ignore` paths rebased into the package. The combined report lists every
+package and averages each analyzer over the packages it ran in; the total
+uses the usual analyzer weights. Package audits run four at a time before
+the packages are analyzed. Findings are located relative to the root,
+and project-level findings point at the package's `package.json`, so
+baselines, `--compare`, `--changed-since`, SARIF, and the GitHub Action
+(`workspaces: true`) work across the whole repository.
+
+```bash
+codediag scan . --workspaces
+codediag scan . --workspaces --format html > monorepo-report.html
+codediag scan . --workspaces --package-threshold 70   # Gate every package too
+```
+
+A combined average can hide one weak package. `packageThreshold` (or
+`--package-threshold`, or the Action's `package-threshold` input) gates every
+package on its own score as well: a package below it fails the scan, is
+named on stderr and in the job summary, and is marked in every report. A
+package's own `.codediag.yml` can set a different `packageThreshold`.
+
+Scanning a workspace root without `--workspaces` scans it as one project and
+suggests the flag.
 
 ### Review-first fix proposals
 
@@ -325,13 +401,16 @@ plain scans are informational; `--ci` uses the default threshold of 70.
 
 ```yaml
 threshold: 70
+failOn: critical         # optional; any active critical finding fails the scan
+packageThreshold: 60     # optional; each --workspaces package must reach it
 ignore: [node_modules, dist, .git, coverage]
 maxFileSizeKb: 512
 scoring:
   version: 2
 rules:
   missing-swagger: off   # or info, warning, critical
-audit: true              # false skips the network-based dependency audit
+audit: true              # false skips the network audit; production skips devDependencies
+secretHistory: false     # true searches the last 1000 commits for removed secrets, or give a number
 analyzers:
   api: true
   security: true
@@ -369,6 +448,8 @@ skipped and reported in the JSON `skipped` summary.
 | Next.js | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Express | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Fastify | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Hono | ✅ | ✅ | ✅ | ✅ | ✅ |
+| tRPC | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Node.js | — | ✅ | ✅ | ✅ | ✅ |
 
 ## Where CodeDiag fits
@@ -404,8 +485,19 @@ results in GitHub Code Scanning.
   prototype pollution, and shell spawn rules; secret scanning in
   configuration files and committed `.env` files; `--compare` and
   `--changed-since`; a redesigned HTML report; VS Code quick fixes.
+- **0.7 "Across":** cross-file taint through helpers and services;
+  `--workspaces` for monorepos (CLI, Action, and VS Code); Hono analysis;
+  `--history` score trends; base-branch deltas in pull request comments;
+  audit advisory details and `audit: production`.
+- **0.8 "Depth":** tRPC procedures; taint through fields, constructors,
+  callbacks, and injected providers; `@fastify/autoload` projects; secrets
+  removed from the tree but kept in Git history; per-package thresholds and
+  `--fail-on` gates; remediation quick fixes in VS Code.
+- **0.9 "Perimeter":** tRPC auth in `createContext`, Express mounts, and
+  Next.js middleware; audits cached for an hour and run concurrently across
+  workspace packages; Dependabot updates that rebuild the Action bundle.
 - **Next:** see [docs/roadmap.md](docs/roadmap.md) for planned framework
-  support, cross-file taint, monorepo scoring, and editor improvements.
+  support, editor improvements, and deeper taint tracking.
 
 ## Contributing
 

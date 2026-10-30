@@ -92,6 +92,30 @@ A POST, PUT, PATCH, or DELETE endpoint has no guard on the method or its control
 
 No health, readiness, or liveness route was detected for runtime monitoring and orchestration probes.
 
+### missing-hono-auth-middleware
+
+**Mutating Hono route without auth middleware** · default severity: `warning`
+
+A POST, PUT, PATCH, or DELETE route has no recognizable authentication middleware (such as jwt(), bearerAuth(), basicAuth(), or a createRoute() middleware) in its own handlers or in an app.use() whose path matches the route and that is registered before it on the same app or on every app that mounts it with app.route(). Hono runs middleware in registration order, so app.use() after the route does not protect it.
+
+- CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
+- OWASP Top 10: A07:2021
+
+### missing-hono-error-handler
+
+**No Hono error handler** · default severity: `info`
+
+No app.onError() handler was found. Hono's default handler logs the error and replies with a plain-text 500, so clients get a response that does not match the API's error format and errors reach no logger or error tracker beyond the console.
+
+### missing-hono-validator
+
+**Hono route without body validator** · default severity: `warning`
+
+A POST, PUT, or PATCH route has no validator for the json or form target (zValidator, vValidator, tbValidator, sValidator, arktypeValidator, or validator() from hono/validator) and no @hono/zod-openapi request body, so the handler reads an unvalidated request body. Validators for param, query, header, or cookie do not count.
+
+- CWE: [CWE-20](https://cwe.mitre.org/data/definitions/20.html)
+- OWASP Top 10: A03:2021
+
 ### missing-request-validation
 
 **Handler without request validation** · default severity: `warning`
@@ -121,6 +145,15 @@ A POST, PUT, or PATCH route declares no schema.body (JSON Schema, TypeBox, or a 
 **Endpoint without OpenAPI documentation** · default severity: `info`
 
 The endpoint and its controller have no @nestjs/swagger decorators, so it is missing from generated API documentation.
+
+### missing-trpc-auth-middleware
+
+**tRPC mutation without auth middleware** · default severity: `warning`
+
+A tRPC mutation is built on a procedure whose .use() middleware chain has no recognizable authentication: no middleware throws a TRPCError with code UNAUTHORIZED or FORBIDDEN, throws when ctx.session, ctx.user, or ctx.auth is missing, or is named like an auth check. Builders are followed through variables and imports to t.procedure, so a builder named protectedProcedure is judged by its middleware, and a .use() whose result is discarded protects nothing, because builders are immutable. Queries and subscriptions are not reported. Findings about builders or middleware imported from packages rely on names and have low confidence.
+
+- CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
+- OWASP Top 10: A07:2021
 
 ### missing-validation-middleware
 
@@ -161,6 +194,14 @@ The project depends on Fastify but no route registrations with a literal path we
 
 - Scoring: sets the analyzer score to 0 (nothing to evaluate)
 
+### no-hono-routes
+
+**No Hono routes** · default severity: `critical`
+
+The project depends on Hono but no route registrations with a literal path were detected.
+
+- Scoring: sets the analyzer score to 0 (nothing to evaluate)
+
 ### no-nextjs-handlers
 
 **API route files without handlers** · default severity: `critical`
@@ -168,6 +209,24 @@ The project depends on Fastify but no route registrations with a literal path we
 Next.js API route files exist but export no detectable HTTP method handlers.
 
 - Scoring: sets the analyzer score to 0 (nothing to evaluate)
+
+### trpc-stack-trace-exposed
+
+**tRPC errors expose stack traces** · default severity: `warning`
+
+The initTRPC instance is created with isDev: true, or with an errorFormatter that returns error.stack outside a condition, so error responses carry server stack traces in production. Without them, tRPC adds the stack only when NODE_ENV is not production.
+
+- CWE: [CWE-209](https://cwe.mitre.org/data/definitions/209.html)
+- OWASP Top 10: A05:2021
+
+### unvalidated-trpc-input
+
+**tRPC input without validation** · default severity: `warning`
+
+A tRPC procedure's .input() parser accepts every value: z.any(), z.unknown(), or z.custom() without a check (also when optional, nullable, or defaulted), Valibot's any() or unknown(), or a parser function that only returns its argument, such as (value) => value as Input. The resolver's input is typed but never checked.
+
+- CWE: [CWE-20](https://cwe.mitre.org/data/definitions/20.html)
+- OWASP Top 10: A03:2021
 
 ## Security
 
@@ -184,7 +243,7 @@ A .env file tracked by Git contains a provider token or a long, high-entropy val
 
 **Dynamic shell command** · default severity: `warning`
 
-A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly or through up to three variable assignments.
+A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep, such as a route passing `req.body.cmd` to `run(cmd)`; findings that depend on such a call have medium confidence.
 
 - CWE: [CWE-78](https://cwe.mitre.org/data/definitions/78.html)
 - OWASP Top 10: A03:2021
@@ -193,7 +252,7 @@ A shell is invoked through exec or execSync, or through spawn, spawnSync, execFi
 
 **Dynamically built SQL query** · default severity: `warning`
 
-A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly or through up to three variable assignments; queries built from request data are reported for any client variable name.
+A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep (medium confidence); queries built from request data are reported for any client variable name.
 
 - CWE: [CWE-89](https://cwe.mitre.org/data/definitions/89.html)
 - OWASP Top 10: A03:2021
@@ -301,7 +360,7 @@ A file handles password data and persists records, but no recognizable password 
 
 **File path from request data** · default severity: `critical`
 
-A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Values passed through path.basename() or checked with startsWith() in the same function are not reported.
+A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Request data is also followed into project helper functions and services up to two calls deep (medium confidence). Values passed through path.basename() or checked with startsWith() in the same function are not reported.
 
 - CWE: [CWE-22](https://cwe.mitre.org/data/definitions/22.html)
 - OWASP Top 10: A01:2021
@@ -332,6 +391,21 @@ res.send(), res.write(), or res.end(), or a Response with a text/html content ty
 
 - CWE: [CWE-79](https://cwe.mitre.org/data/definitions/79.html)
 - OWASP Top 10: A03:2021
+
+### secret-history-incomplete
+
+**Git history scan incomplete** · default severity: `info`
+
+The Git history scan for removed secrets stopped at its output size or time limit, so older commits were not checked. The findings it reports cover the commits it read.
+
+### secret-in-git-history
+
+**Secret in Git history** · default severity: `critical`
+
+A commit on the checked-out branch added a credential that is no longer in the current tree, but every clone and fork still contains it. Only scanned with `secretHistory` in .codediag.yml or `--secret-history`: added lines of recent commits are checked for provider formats (private keys, AWS, GitHub, Stripe, Slack, npm, Google, Anthropic, OpenAI, SendGrid, database URLs with a password) and, in configuration and .env files, long random values of secret-like keys. Secrets still in the current tree are left to the other secret rules. Rotate or revoke the credential; rewriting history does not revoke it. Findings never include the value.
+
+- CWE: [CWE-798](https://cwe.mitre.org/data/definitions/798.html), [CWE-312](https://cwe.mitre.org/data/definitions/312.html)
+- OWASP Top 10: A07:2021
 
 ### server-side-request-forgery
 

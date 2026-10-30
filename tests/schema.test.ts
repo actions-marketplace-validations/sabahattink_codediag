@@ -156,3 +156,37 @@ test("JSON schema accepts a compared, scoped scan with new findings", () => {
 
   assert.equal(validate(result), true, JSON.stringify(validate.errors));
 });
+
+test("JSON schema accepts a combined workspace report", () => {
+  const result = validResult();
+  result.workspace = {
+    tool: "pnpm",
+    packages: [
+      {
+        path: "apps/api",
+        name: "@acme/api",
+        framework: "express",
+        totalScore: 84,
+        grade: "B+",
+        findings: 1,
+        threshold: 80,
+      },
+      {
+        path: "apps/edge",
+        framework: "hono",
+        totalScore: 92,
+        grade: "A",
+        findings: 0,
+      },
+      {
+        path: "libs/shared",
+        framework: "generic",
+        totalScore: 100,
+        grade: "A+",
+        findings: 0,
+      },
+    ],
+  };
+
+  assert.equal(validate(result), true, JSON.stringify(validate.errors));
+});

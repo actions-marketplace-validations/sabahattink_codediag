@@ -15,7 +15,9 @@ function normalize(text: string): string {
  * - With a source line: the line's normalized text plus the message, so short
  *   lines such as `@Post()` are told apart by what the finding says. Lines
  *   that may hold a credential are never hashed.
- * - With a file but no line: nothing beyond the rule and file.
+ * - With a file but no line: nothing beyond the rule and file, unless the
+ *   rule's message tells findings in one file apart (the commit that added a
+ *   secret to Git history).
  * - Without a file: the message with numbers masked, so a changing count
  *   (such as a test ratio) keeps its identity, unless the rule declares that
  *   counts are identity (vulnerability totals).
@@ -27,22 +29,28 @@ function anchor(issue: DiagnosticIssue, lineText: string | null): string {
     const line = lineText === null ? "" : normalize(lineText);
     return rule?.sensitiveSource || !line ? message : `${line}\u0001${message}`;
   }
-  if (issue.file) return "";
+  if (issue.file) return rule?.messageIsIdentity ? message : "";
   return rule?.countsAreIdentity
     ? message
     : message.replace(/\d+(?:\.\d+)?/g, "#");
 }
 
+/**
+ * `namespace` is a workspace package's path: it keeps findings of different
+ * packages apart when their reports are combined.
+ */
 export function computeFingerprint(
   issue: DiagnosticIssue,
   lineText: string | null,
   occurrence = 0,
+  namespace?: string,
 ): string {
+  const file = namespace
+    ? `${namespace}/${issue.file ?? ""}`
+    : (issue.file ?? "");
   return createHash("sha256")
     .update(
-      [issue.rule, issue.file ?? "", anchor(issue, lineText), occurrence].join(
-        "\u0000",
-      ),
+      [issue.rule, file, anchor(issue, lineText), occurrence].join("\u0000"),
     )
     .digest("hex");
 }
@@ -54,6 +62,7 @@ export function computeFingerprint(
 export function assignFingerprints(
   results: AnalyzerResult[],
   readText: (file: string) => string | null,
+  namespace?: string,
 ): AnalyzerResult[] {
   const lineCache = new Map<string, string[] | null>();
   const occurrences = new Map<string, number>();
@@ -70,13 +79,15 @@ export function assignFingerprints(
     ...result,
     issues: result.issues.map((issue) => {
       const text = lineText(issue);
-      const base = computeFingerprint(issue, text);
+      const base = computeFingerprint(issue, text, 0, namespace);
       const occurrence = occurrences.get(base) ?? 0;
       occurrences.set(base, occurrence + 1);
       return {
         ...issue,
         fingerprint:
-          occurrence === 0 ? base : computeFingerprint(issue, text, occurrence),
+          occurrence === 0
+            ? base
+            : computeFingerprint(issue, text, occurrence, namespace),
       };
     }),
   }));

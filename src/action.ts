@@ -1,7 +1,25 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { isBelowThreshold, loadConfig, parseThreshold } from "./config.js";
+import { isShallowRepository } from "./analyzers/secret-history.js";
+import {
+  failOnMessage,
+  findingsAtOrAbove,
+  isBelowThreshold,
+  loadConfig,
+  packagesBelowThreshold,
+  packageThresholdMessage,
+  parseFailOn,
+  parseSecretHistory,
+  parseThreshold,
+} from "./config.js";
 import { loadBaseline } from "./core/baseline.js";
+import {
+  compareWithPrevious,
+  formatDelta,
+  loadReport,
+} from "./core/compare.js";
+import { scanWorkspace } from "./core/workspace-scan.js";
+import { detectWorkspaces } from "./core/workspaces.js";
 import {
   changedFiles,
   GitHubRequestError,
@@ -12,7 +30,7 @@ import { activeIssues, inactiveCounts } from "./core/issues.js";
 import { previousScore, renderPrComment } from "./reporters/pr-comment.js";
 import { renderSarif } from "./reporters/sarif.js";
 import { scan } from "./scanner.js";
-import type { DiagnosticIssue, ScanResult } from "./types.js";
+import type { CodediagConfig, DiagnosticIssue, ScanResult } from "./types.js";
 
 const MAX_ANNOTATIONS = 50;
 
@@ -21,13 +39,20 @@ function getInput(name: string, fallback: string): string {
   return value || fallback;
 }
 
-function workflowEscape(value: string): string {
+/**
+ * Escapes a workflow command's message. The runner decodes only these three
+ * in messages, so ":" and "," stay literal there.
+ */
+function workflowData(value: string): string {
   return value
     .replaceAll("%", "%25")
     .replaceAll("\r", "%0D")
-    .replaceAll("\n", "%0A")
-    .replaceAll(":", "%3A")
-    .replaceAll(",", "%2C");
+    .replaceAll("\n", "%0A");
+}
+
+/** Escapes a workflow command property, such as `file=` or `title=`. */
+function workflowEscape(value: string): string {
+  return workflowData(value).replaceAll(":", "%3A").replaceAll(",", "%2C");
 }
 
 function markdownEscape(value: string): string {
@@ -49,7 +74,7 @@ function issueAnnotation(issue: DiagnosticIssue): string {
   if (issue.line) properties.push(`line=${issue.line}`);
   properties.push(`title=${workflowEscape(`CodeDiag ${issue.rule}`)}`);
 
-  return `::${level} ${properties.join(",")}::${workflowEscape(issue.message)}`;
+  return `::${level} ${properties.join(",")}::${workflowData(issue.message)}`;
 }
 
 function emitAnnotations(result: ScanResult): void {
@@ -68,7 +93,11 @@ function emitAnnotations(result: ScanResult): void {
   }
 }
 
-function renderSummary(result: ScanResult, threshold: number): string {
+function renderSummary(
+  result: ScanResult,
+  threshold: number,
+  failOn: CodediagConfig["failOn"],
+): string {
   const lines = [
     "## CodeDiag project health",
     "",
@@ -85,6 +114,35 @@ function renderSummary(result: ScanResult, threshold: number): string {
   }
 
   lines.push("", `Required threshold: **${threshold}/100**`);
+  if (failOn) {
+    const blocking = findingsAtOrAbove(result.analyzers, failOn).length;
+    lines.push(
+      "",
+      blocking > 0
+        ? `Fails on **${failOn}**: ${failOnMessage(blocking, failOn)}.`
+        : `Fails on **${failOn}**: no active findings at or above ${failOn} severity.`,
+    );
+  }
+  const failingPackages = packagesBelowThreshold(result.workspace);
+  if (failingPackages.length > 0) {
+    lines.push(
+      "",
+      `Packages below their threshold: ${failingPackages
+        .map(
+          (entry) =>
+            `${markdownEscape(entry.path)} (${entry.totalScore}/${entry.threshold})`,
+        )
+        .join(", ")}`,
+    );
+  }
+  if (result.comparison) {
+    const { previousScore, scoreDelta, newFindings, fixedFindings } =
+      result.comparison;
+    lines.push(
+      "",
+      `Compared with the base report: ${previousScore} → ${result.totalScore} (${formatDelta(scoreDelta)}), ${newFindings} new, ${fixedFindings} fixed.`,
+    );
+  }
   const inactive = inactiveCounts(result.analyzers);
   if (inactive.suppressed > 0 || inactive.baseline > 0) {
     lines.push(
@@ -121,6 +179,20 @@ function parseBooleanInput(name: string, value: string): boolean {
   throw new Error(`${name} must be true or false.`);
 }
 
+/** Empty leaves `secretHistory` in .codediag.yml in charge. */
+function parseSecretHistoryInput(value: string): false | number | undefined {
+  if (value === "") return undefined;
+  if (/^(?:false|no|0)$/i.test(value)) return false;
+  if (/^(?:true|yes)$/i.test(value)) return parseSecretHistory(true);
+  try {
+    return parseSecretHistory(value);
+  } catch {
+    throw new Error(
+      "secret-history must be true, false, or a number of commits from 1 to 100000.",
+    );
+  }
+}
+
 /**
  * Creates or updates CodeDiag's pull request comment. A failure only warns,
  * because the scan result and threshold must not depend on comment access.
@@ -128,6 +200,7 @@ function parseBooleanInput(name: string, value: string): boolean {
 async function commentOnPullRequest(
   result: ScanResult,
   threshold: number,
+  failOn: CodediagConfig["failOn"],
   workspace: string,
   projectPath: string,
 ): Promise<void> {
@@ -154,6 +227,7 @@ async function commentOnPullRequest(
       renderPrComment({
         result,
         threshold,
+        failOn,
         changedFiles: files,
         projectDirectory,
         previousScore: previousBody ? previousScore(previousBody) : undefined,
@@ -168,7 +242,7 @@ async function commentOnPullRequest(
         : "";
     const message = error instanceof Error ? error.message : String(error);
     console.log(
-      `::warning title=CodeDiag pull request comment::${workflowEscape(`${message}.${hint}`)}`,
+      `::warning title=CodeDiag pull request comment::${workflowData(`${message}.${hint}`)}`,
     );
   }
 }
@@ -214,9 +288,49 @@ export async function runAction(): Promise<void> {
       ? loadBaseline(resolveWorkspacePath(workspace, baselineInput))
       : undefined;
 
-    const result = await scan(projectPath, loadConfig(projectPath), {
-      baseline,
-    });
+    const config = loadConfig(projectPath);
+    const failOnInput = getInput("fail-on", "");
+    const failOn = failOnInput ? parseFailOn(failOnInput) : config.failOn;
+    const wantsWorkspaces = parseBooleanInput(
+      "workspaces",
+      getInput("workspaces", "false"),
+    );
+    const packageThresholdInput = getInput("package-threshold", "");
+    const packageThreshold = packageThresholdInput
+      ? parseThreshold(packageThresholdInput, "package-threshold")
+      : undefined;
+    if (packageThreshold !== undefined && !wantsWorkspaces) {
+      throw new Error("package-threshold needs workspaces: true.");
+    }
+    const workspaces = wantsWorkspaces ? detectWorkspaces(projectPath) : null;
+    if (wantsWorkspaces && !workspaces) {
+      throw new Error(
+        "workspaces is true, but no workspace packages were found (package.json workspaces, pnpm-workspace.yaml, lerna.json, or nx.json).",
+      );
+    }
+    const compareInput = validatePathInput("compare", getInput("compare", ""));
+    const previous = compareInput
+      ? loadReport(resolveWorkspacePath(workspace, compareInput))
+      : undefined;
+    const secretHistory = parseSecretHistoryInput(
+      getInput("secret-history", ""),
+    );
+    const scanOptions = { baseline, secretHistory };
+    const scanned = workspaces
+      ? await scanWorkspace(projectPath, config, workspaces, {
+          ...scanOptions,
+          packageThreshold,
+        })
+      : await scan(projectPath, config, scanOptions);
+    if (
+      (secretHistory ?? config.secretHistory) !== false &&
+      isShallowRepository(projectPath)
+    ) {
+      console.log(
+        "::warning title=CodeDiag secret history::The checkout is shallow, so only part of the Git history was searched for removed secrets. Use actions/checkout with fetch-depth: 0.",
+      );
+    }
+    const result = previous ? compareWithPrevious(scanned, previous) : scanned;
 
     mkdirSync(dirname(reportPath), { recursive: true });
     writeFileSync(reportPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
@@ -232,7 +346,7 @@ export async function runAction(): Promise<void> {
     if (process.env.GITHUB_STEP_SUMMARY) {
       appendFileSync(
         process.env.GITHUB_STEP_SUMMARY,
-        renderSummary(result, threshold),
+        renderSummary(result, threshold, failOn),
         "utf8",
       );
     }
@@ -242,7 +356,13 @@ export async function runAction(): Promise<void> {
     );
 
     if (parseBooleanInput("comment", getInput("comment", "false"))) {
-      await commentOnPullRequest(result, threshold, workspace, projectPath);
+      await commentOnPullRequest(
+        result,
+        threshold,
+        failOn,
+        workspace,
+        projectPath,
+      );
     }
 
     if (isBelowThreshold(result.totalScore, threshold)) {
@@ -251,10 +371,23 @@ export async function runAction(): Promise<void> {
       );
       process.exitCode = 1;
     }
+    const blocking = findingsAtOrAbove(result.analyzers, failOn);
+    if (failOn && blocking.length > 0) {
+      console.log(
+        `::error title=CodeDiag fail-on not met::${workflowData(failOnMessage(blocking.length, failOn))} (fail-on: ${failOn}).`,
+      );
+      process.exitCode = 1;
+    }
+    for (const entry of packagesBelowThreshold(result.workspace)) {
+      console.log(
+        `::error title=CodeDiag package threshold not met::${workflowData(packageThresholdMessage(entry))}.`,
+      );
+      process.exitCode = 1;
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(
-      `::error title=CodeDiag action failed::${workflowEscape(message)}`,
+      `::error title=CodeDiag action failed::${workflowData(message)}`,
     );
     process.exitCode = 2;
   }

@@ -37,7 +37,11 @@ for (const [name, framework] of [
   ["realistic/nestjs", "nestjs"],
   ["realistic/express", "express"],
   ["realistic/fastify", "fastify"],
+  ["realistic/fastify-autoload", "fastify"],
+  ["realistic/hono", "hono"],
   ["realistic/nextjs", "nextjs"],
+  // A T3 app: tRPC procedures served by a Next.js route handler.
+  ["realistic/trpc", "nextjs"],
 ] as const) {
   test(`${name} scores at least 85 with no critical findings`, async () => {
     const result = await scanFixture(name);
@@ -134,6 +138,108 @@ test("defects/express-session keeps its JWT, cookie, injection, and secret findi
   ]);
 });
 
+test("defects/express-helpers follows request data into and out of helper modules", async () => {
+  const result = await scanFixture("defects/express-helpers");
+  const security = result.analyzers.find(
+    (analyzer) => analyzer.name === "Security",
+  );
+  const located = (security?.issues ?? [])
+    .filter((issue) => issue.line !== undefined)
+    .map(
+      ({ rule, severity, file, line, confidence }) =>
+        `${severity} ${rule} ${file}:${line} ${confidence ?? "high"}`,
+    )
+    .sort();
+
+  assert.deepEqual(located, [
+    "critical dynamic-command-execution src/lib/convert.js:4 medium",
+    "critical dynamic-sql-query src/services/reports.js:7 medium",
+    "critical path-traversal src/lib/files.js:7 medium",
+    "warning server-side-request-forgery src/app.js:25 medium",
+  ]);
+  const traversal = security?.issues.find(
+    (issue) => issue.rule === "path-traversal",
+  );
+  assert.match(
+    traversal?.fix ?? "",
+    /^Request data reaches this call from src\/app\.js:12; /,
+  );
+});
+
+test("realistic/fastify-autoload gets prefixes and autohooks from @fastify/autoload", async () => {
+  const result = await scanFixture("realistic/fastify-autoload");
+  const api = result.analyzers.find(
+    (analyzer) => analyzer.name === "API Health",
+  );
+
+  assert.deepEqual(api?.issues, []);
+  assert.equal(api?.score, 100);
+  assert.match(api?.summary ?? "", /^6 Fastify endpoints/);
+});
+
+test("defects/express-state follows request data through fields, constructors, callbacks, and module state", async () => {
+  const result = await scanFixture("defects/express-state");
+  const security = result.analyzers.find(
+    (analyzer) => analyzer.name === "Security",
+  );
+  const issues = (security?.issues ?? []).filter(
+    (issue) => issue.line !== undefined,
+  );
+  const located = issues
+    .map(
+      ({ rule, severity, file, line, confidence }) =>
+        `${severity} ${rule} ${file}:${line} ${confidence ?? "high"}`,
+    )
+    .sort();
+
+  assert.deepEqual(located, [
+    "critical dynamic-command-execution src/commands.ts:14 high",
+    "critical dynamic-command-execution src/jobs/backup-job.ts:7 medium",
+    "critical path-traversal src/app.ts:33 medium",
+    "critical path-traversal src/app.ts:38 high",
+    "critical path-traversal src/jobs/export-job.ts:12 medium",
+    "warning dynamic-command-execution src/jobs/build-job.ts:8 high",
+    "warning server-side-request-forgery src/app.ts:47 high",
+  ]);
+  const origins = Object.fromEntries(
+    issues
+      .filter((issue) => issue.confidence === "medium")
+      .map((issue) => [
+        `${issue.file}:${issue.line}`,
+        /^Request data reaches this call from ([^;]+);/.exec(
+          issue.fix ?? "",
+        )?.[1],
+      ]),
+  );
+  assert.deepEqual(origins, {
+    "src/app.ts:33": "src/app.ts:33",
+    "src/jobs/backup-job.ts:7": "src/app.ts:17",
+    "src/jobs/export-job.ts:12": "src/jobs/export-job.ts:8",
+  });
+});
+
+test("defects/nestjs-di follows request data into providers behind tokens and abstract classes", async () => {
+  const result = await scanFixture("defects/nestjs-di");
+  const security = result.analyzers.find(
+    (analyzer) => analyzer.name === "Security",
+  );
+  const located = (security?.issues ?? [])
+    .filter((issue) => issue.line !== undefined)
+    .map(
+      ({ rule, severity, file, line, confidence, fix }) =>
+        `${severity} ${rule} ${file}:${line} ${confidence ?? "high"} from ${
+          /^Request data reaches this call from ([^;]+);/.exec(fix ?? "")?.[1]
+        }`,
+    )
+    .sort();
+
+  assert.equal(result.stack.framework, "nestjs");
+  assert.deepEqual(located, [
+    "critical dynamic-sql-query src/reports/sql-reports.repository.ts:12 medium from src/reports/reports.controller.ts:14",
+    "critical path-traversal src/files/disk-file-store.ts:9 medium from src/files/files.controller.ts:10",
+  ]);
+});
+
 test("defects/fastify keeps its auth hook, schema, and error handler findings", async () => {
   const result = await scanFixture("defects/fastify");
   const api = result.analyzers.find(
@@ -185,6 +291,165 @@ test("defects/fastify keeps its auth hook, schema, and error handler findings", 
         message: "No health, readiness, or liveness endpoint detected",
         confidence: undefined,
       },
+    ],
+  );
+});
+
+test("defects/hono keeps its middleware order, validator, and error handler findings", async () => {
+  const result = await scanFixture("defects/hono");
+  const api = result.analyzers.find(
+    (analyzer) => analyzer.name === "API Health",
+  );
+
+  assert.equal(result.stack.framework, "hono");
+  assert.deepEqual(
+    api?.issues.map(({ rule, severity, line, message, confidence }) => ({
+      rule,
+      severity,
+      line,
+      message,
+      confidence,
+    })),
+    [
+      {
+        rule: "missing-hono-auth-middleware",
+        severity: "warning",
+        line: 10,
+        message: "DELETE /admin/users/:id has no recognizable auth middleware",
+        confidence: "high",
+      },
+      {
+        rule: "missing-hono-auth-middleware",
+        severity: "warning",
+        line: 21,
+        message: "POST /webhooks has no recognizable auth middleware",
+        confidence: "high",
+      },
+      {
+        rule: "missing-hono-validator",
+        severity: "warning",
+        line: 17,
+        message: "PATCH /account/:id has no json or form validator",
+        confidence: "high",
+      },
+      {
+        rule: "missing-hono-validator",
+        severity: "warning",
+        line: 21,
+        message: "POST /webhooks has no json or form validator",
+        confidence: "high",
+      },
+      {
+        rule: "missing-hono-error-handler",
+        severity: "info",
+        line: undefined,
+        message: "No Hono error handler is registered with onError()",
+        confidence: undefined,
+      },
+      {
+        rule: "missing-health-endpoint",
+        severity: "info",
+        line: undefined,
+        message: "No health, readiness, or liveness endpoint detected",
+        confidence: undefined,
+      },
+    ],
+  );
+});
+
+test("realistic/trpc checks every procedure without findings", async () => {
+  const result = await scanFixture("realistic/trpc");
+  const api = result.analyzers.find(
+    (analyzer) => analyzer.name === "API Health",
+  );
+
+  assert.equal(result.totalScore, 100, describe(result));
+  assert.deepEqual(findings(result), []);
+  assert.equal(
+    api?.summary,
+    "1 Next.js handlers across 2 API route files; 7 tRPC procedures in 3 routers",
+  );
+});
+
+test("defects/trpc keeps its procedure, input, stack trace, and injection findings", async () => {
+  const result = await scanFixture("defects/trpc");
+  const api = result.analyzers.find(
+    (analyzer) => analyzer.name === "API Health",
+  );
+  const security = result.analyzers.find(
+    (analyzer) => analyzer.name === "Security",
+  );
+
+  assert.equal(result.stack.framework, "trpc");
+  assert.deepEqual(
+    api?.issues.map(({ rule, file, line, message, confidence }) => ({
+      rule,
+      at: `${file}:${line}`,
+      message,
+      confidence,
+    })),
+    [
+      {
+        rule: "missing-trpc-auth-middleware",
+        at: "src/routers/admin.ts:10",
+        message:
+          "Mutation admin.users.delete has no recognizable auth middleware",
+        confidence: "high",
+      },
+      {
+        rule: "missing-trpc-auth-middleware",
+        at: "src/routers/files.ts:16",
+        message: "Mutation files.upload has no recognizable auth middleware",
+        confidence: "high",
+      },
+      {
+        rule: "missing-trpc-auth-middleware",
+        at: "src/routers/posts.ts:13",
+        message: "Mutation posts.create has no recognizable auth middleware",
+        confidence: "high",
+      },
+      {
+        rule: "unvalidated-trpc-input",
+        at: "src/routers/files.ts:16",
+        message:
+          "Input of mutation files.upload is not validated: z.any() accepts any value",
+        confidence: "high",
+      },
+      {
+        rule: "unvalidated-trpc-input",
+        at: "src/routers/files.ts:18",
+        message:
+          "Input of mutation files.rename is not validated: the parser returns its argument without checking it",
+        confidence: "high",
+      },
+      {
+        rule: "trpc-stack-trace-exposed",
+        at: "src/trpc.ts:6",
+        message:
+          "initTRPC.create() sets isDev: true, so error responses include stack traces in production",
+        confidence: undefined,
+      },
+      {
+        rule: "trpc-stack-trace-exposed",
+        at: "src/trpc.ts:8",
+        message:
+          "The tRPC errorFormatter returns error.stack in every environment",
+        confidence: undefined,
+      },
+    ],
+  );
+  assert.deepEqual(
+    (security?.issues ?? [])
+      .filter((issue) => issue.line !== undefined)
+      .map(
+        ({ rule, severity, file, line, confidence }) =>
+          `${severity} ${rule} ${file}:${line} ${confidence ?? "high"}`,
+      )
+      .sort(),
+    [
+      "critical dynamic-command-execution src/lib/convert.ts:4 medium",
+      "critical dynamic-command-execution src/routers/files.ts:9 high",
+      "critical path-traversal src/routers/files.ts:12 high",
     ],
   );
 });

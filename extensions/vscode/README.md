@@ -21,6 +21,11 @@ asks you to choose a folder.
 CodeDiag problems offer quick fixes from the light bulb, `Ctrl+.`, or the
 Problems panel:
 
+- **Remediations** for rules with one mechanical fix, offered as the
+  preferred fix: enable TLS certificate verification
+  (`rejectUnauthorized: true`), verify JWT expiration
+  (`ignoreExpiration: false`), and drop `"none"` from a JWT `algorithms`
+  list.
 - **Suppress `<rule>` on this line** inserts
   `// codediag-ignore-next-line <rule> -- ` above the finding, indented
   like the flagged line.
@@ -44,6 +49,11 @@ not apply it.
 `codediag.scanOnSave` is disabled by default. When enabled, a scan starts 750 ms
 after a file is saved. A scan may run the detected package manager's audit
 command and therefore may access the network.
+
+`codediag.scanWorkspacePackages` is enabled by default. When the workspace
+folder is a monorepo root (npm, pnpm, or Yarn workspaces, Lerna, or Nx), each
+package is scanned with its own stack and configuration and the results are
+combined, as `codediag scan --workspaces` does.
 
 CodeDiag does not run in untrusted or virtual workspaces. Fix plans and AI
 prompts never modify project files or upload source contents.

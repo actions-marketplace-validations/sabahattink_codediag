@@ -1,54 +1,55 @@
 # Roadmap
 
-CodeDiag 0.3 made the engine reliable; 0.4 through 0.6 widened what it sees:
-web security sinks, pull request comments, Fastify, JWT and session
+CodeDiag 0.3 made the engine reliable; 0.4 through 0.6 widened what it sees
+(web security sinks, pull request comments, Fastify, JWT and session
 misconfiguration, template injection, prototype pollution, secret scanning
-beyond code, comparisons between scans, and changed-files mode. These are the
-next candidates, roughly in priority order. Each one should ship with
-realistic and defect fixtures in `tests/fixtures/` and keep the benchmark
-tests green.
+beyond code, comparisons between scans, and changed-files mode); 0.7 reached
+across files and repositories (cross-file taint, monorepo workspaces, Hono,
+score history, base-branch deltas, and audit details); and 0.8 went deeper:
+tRPC, taint through fields, constructors, callbacks, and injected providers,
+`@fastify/autoload`, secrets kept in Git history, per-package and severity
+gates, and remediation quick fixes; 0.9 recognized tRPC auth in front of the
+procedures and made audits cached and concurrent. These are the next
+candidates, roughly in
+priority order. Each one should ship with realistic and defect fixtures in
+`tests/fixtures/` and keep the benchmark tests green.
 
 ## Precision and depth
 
-- **Cross-file taint:** follow request data through helper functions and
-  service calls, not only within one function and its enclosing scopes.
-- **Fastify autoload:** follow `@fastify/autoload` directories so hooks and
-  prefixes from autoloaded plugins apply to their routes.
-- **Secret scanning in Git history:** report credentials that were committed
-  and later removed, with the same redaction as today.
-- **Dependency audit options:** production-only audits, audit result caching
-  keyed by the lock file hash, and advisory-level details in reports.
+- **Instance-sensitive taint:** today any `new X(requestData)` taints the
+  fields of every `X`; still missing are fields written by a base class or
+  from outside the class, `super()` calls, `Object.assign(this, ...)`,
+  property writes on module objects, and factory providers (`useFactory`,
+  `useValue`).
+- **tRPC perimeters beyond Express and Next.js:** auth hooks around
+  `fastifyTRPCPlugin` and Hono's `trpcServer`, and Auth.js v5 middleware
+  whose `authorized` callback decides access.
+- **Git history beyond HEAD:** other branches and tags, and merge commits.
+- **One audit per lock file:** workspace packages that share a root lock
+  file still each run an audit (now concurrently and cached); one audit
+  reported once on the root would be faster and avoid repeated findings.
 
 ## Frameworks
 
-- **Hono** API analyzer (routes, middleware, validators).
-- **tRPC** procedures (protected versus public procedures, input
-  validation).
 - **Remix / React Router and SvelteKit** server endpoints.
+- **tRPC v9** routers and standalone tRPC servers' security headers.
 
 ## Monorepos and pull requests
 
-- **Workspace awareness:** detect npm, pnpm, and Yarn workspaces, Nx, and
-  Turborepo; score each package and report a combined result.
-- **Base-branch delta in pull request comments:** compare against the base
-  branch's report with `--compare`, not only the previous comment's score.
-- **History view:** keep several reports and chart the score over time in the
-  HTML report. (Comparing with one earlier report shipped in 0.6.)
+- **Parallel workspace analysis:** package audits already run
+  concurrently; the analysis itself still runs one package at a time.
 
 ## Editor
 
 - **Incremental scans** in a worker so the VS Code extension host never
   blocks, re-analyzing only changed files.
-- **Remediation quick fixes** beyond suppressions, for rules with a safe
-  mechanical fix. (Suppress and explain quick fixes shipped in 0.6.)
+- **More remediation quick fixes** for rules with a safe mechanical fix.
+  (TLS verification, JWT expiration, and the JWT `none` algorithm shipped in
+  0.8.)
 - **Marketplace and Open VSX publishing.**
-
-## AI handoff
-
-- Richer `--format prompt` output that groups related findings and includes
-  the rule documentation, still review-only and without source contents.
 
 ## Out of scope
 
 CodeDiag will not upload source code, require an account, or apply changes
-automatically. Fix plans and prompts stay review-only.
+automatically. Fix plans and prompts stay review-only, and quick fixes apply
+only when you choose them.

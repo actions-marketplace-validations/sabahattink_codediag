@@ -33,7 +33,7 @@ jobs:
 ```
 
 `@v0` follows the latest 0.x release. Pin an exact release such as
-`@v0.6.0`, or a full commit SHA, when a workflow requires immutable
+`@v0.9.0`, or a full commit SHA, when a workflow requires immutable
 third-party dependencies.
 
 ## Inputs
@@ -42,9 +42,14 @@ third-party dependencies.
 | --- | --- | --- |
 | `path` | `.` | Project directory relative to `GITHUB_WORKSPACE` |
 | `threshold` | `70` | Minimum passing score from 0 through 100 |
+| `fail-on` | _(config)_ | Fail on any active finding at or above `critical`, `warning`, or `info`, whatever the score; overrides `failOn` in `.codediag.yml` |
 | `report` | `codediag-report.json` | JSON report path relative to `GITHUB_WORKSPACE` |
 | `sarif` | `codediag-report.sarif` | SARIF 2.1.0 report path relative to `GITHUB_WORKSPACE` |
 | `baseline` | _(none)_ | Optional CodeDiag JSON report relative to `GITHUB_WORKSPACE`; its findings do not affect the score, threshold, or annotations. See [baselines](suppressions-and-baselines.md#baselines) |
+| `compare` | _(none)_ | Optional JSON report of the base branch relative to `GITHUB_WORKSPACE`; the comment and job summary show the score change against it and which findings are new or fixed. See [comparing with the base branch](#comparing-with-the-base-branch) |
+| `workspaces` | `false` | Scan every workspace package below `path` (npm, pnpm, Yarn, Lerna, Nx) and combine the reports; see [monorepos](../README.md#monorepos) |
+| `package-threshold` | _(config)_ | With `workspaces: true`, the minimum score of every package; overrides `packageThreshold` in `.codediag.yml` |
+| `secret-history` | _(config)_ | Also report secrets that recent commits added and the current tree no longer has: `true` reads the last 1000 commits, a number sets the limit, `false` turns off `secretHistory` from `.codediag.yml`. Needs `fetch-depth: 0`; see [secrets in Git history](#secrets-in-git-history) |
 | `comment` | `false` | Post and update one pull request comment; see [pull request comments](#pull-request-comments) |
 | `github-token` | `${{ github.token }}` | Token for reading changed files and writing the comment |
 
@@ -120,7 +125,54 @@ The action exits with:
   written so later steps using `if: always()` can inspect them.
 - `2` when configuration, scanning, or report generation fails.
 
+### Comparing with the base branch
+
+By default the comment shows the change since the previous push. To compare
+with the base branch instead, give the Action a report of the base branch,
+for example one uploaded by the workflow that runs on `main`:
+
+```yaml
+# On pushes to main
+- uses: sabahattink/codediag@v0
+  with:
+    report: codediag-main.json
+- uses: actions/upload-artifact@v4
+  with:
+    name: codediag-main
+    path: codediag-main.json
+
+# On pull requests
+- uses: dawidd6/action-download-artifact@v6
+  with:
+    branch: main
+    name: codediag-main
+- uses: sabahattink/codediag@v0
+  with:
+    comment: true
+    compare: codediag-main.json
+```
+
+The comment then reads, for example, `▼ −3 vs. the base branch (81) · 1 new ·
+2 fixed`, and marks new findings in changed files as **new**. The job summary
+and the JSON report carry the same comparison.
+
 ## Monorepo example
+
+Scan every workspace package and combine the reports:
+
+```yaml
+- uses: sabahattink/codediag@v0
+  with:
+    workspaces: true
+    threshold: 80
+    package-threshold: 70
+```
+
+With `package-threshold`, a package that scores below it fails the job on its
+own, with an error annotation naming the package, even when the combined
+score passes.
+
+Or scan one package with its own threshold and reports:
 
 ```yaml
 - uses: sabahattink/codediag@v0
@@ -131,6 +183,32 @@ The action exits with:
     report: artifacts/api-codediag.json
     sarif: artifacts/api-codediag.sarif
 ```
+
+## Secrets in Git history
+
+A credential that was committed and later deleted is still in every clone.
+With `secret-history`, the Action also reads the added lines of recent
+commits and reports such secrets as `secret-in-git-history`. It needs the
+history, so check out the full repository; the default `fetch-depth: 1`
+checkout contains only the newest commit, and the Action warns that the
+history it read is partial:
+
+```yaml
+steps:
+  - uses: actions/checkout@v7
+    with:
+      fetch-depth: 0
+  - uses: sabahattink/codediag@v0
+    with:
+      threshold: 80
+      secret-history: true   # or a number of commits, such as 5000
+```
+
+Only the checked-out branch is read (`HEAD`, not every ref), and secrets
+that are still in the current tree are left to `hardcoded-secret` and
+`committed-env-secret`. Findings name the kind of secret, the file, and the
+commit; never the value. See
+[security analysis](security-analysis.md#secrets-in-git-history).
 
 ## GitHub Code Scanning
 

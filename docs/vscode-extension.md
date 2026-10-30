@@ -38,9 +38,17 @@ Every CodeDiag problem offers code actions of kind Quick Fix:
 
 | Action | Effect |
 | --- | --- |
+| Enable TLS certificate verification | `tls-verification-disabled`: rewrites `rejectUnauthorized: false` to `true`. |
+| Verify the token's expiration time | `jwt-expiration-ignored`: rewrites `ignoreExpiration: true` to `false`. |
+| Stop accepting the "none" algorithm | `jwt-none-algorithm`: removes `"none"` from a literal `algorithms` list that keeps another algorithm. |
 | Suppress `<rule>` on this line | Inserts `// codediag-ignore-next-line <rule> -- ` above the finding with the same indentation. |
 | Suppress `<rule>` in this file | Inserts `// codediag-ignore-file <rule> -- ` after the shebang and leading comments. |
 | Explain `<rule>` | Opens the rule's section of the [rule reference](rules.md). |
+
+The first three are remediations: the fix the rule asks for, offered as the
+preferred quick fix only when the finding's line holds exactly the reported
+setting once. A line edited since the scan, a list of only `"none"`, or a
+computed list gets no remediation. The next scan confirms the fix.
 
 Directives are inserted with the cursor right after `--`, so you type the
 justification there. CodeDiag does not apply a directive without a reason
@@ -69,9 +77,18 @@ not apply them. Each problem's rule ID also links to the rule reference.
 `codediag.scanOnSave` is off by default. Enabling it starts a debounced scan
 after saves. Scans started by saving a file never run the package manager:
 they reuse the dependency audit from the last command-triggered scan of the
-same lock file, so scores stay consistent, and report `audit-skipped` until
-one has run. Commands run from the Command Palette follow the project's
+same lock file, or an audit of it cached on disk within the hour, so scores
+stay consistent, and report `audit-skipped` until one has run. Commands run from the Command Palette follow the project's
 `audit` setting.
+
+## Monorepos
+
+`codediag.scanWorkspacePackages` is on by default. When the workspace folder
+is a monorepo root (npm, pnpm, or Yarn workspaces, Lerna, or Nx), each package
+is scanned with its own stack detection and configuration and the results are
+combined, as `codediag scan --workspaces` does. Problems keep their real file
+locations, and package-level findings appear on each package's
+`package.json`. Turn the setting off to scan the root as one project.
 
 ## Trust and data boundaries
 

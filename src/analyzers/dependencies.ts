@@ -1,10 +1,21 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ScanContext } from "../core/scan-context.js";
 import { fromRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue, PackageJson } from "../types.js";
+import {
+  type AuditAdvisory,
+  describeAdvisories,
+  parseAuditAdvisories,
+} from "./audit-advisories.js";
+import {
+  auditAge,
+  auditCacheFile,
+  persistAudit,
+  readPersistedAudit,
+} from "./audit-cache.js";
 
 interface AuditSummary {
   critical: number;
@@ -89,10 +100,20 @@ function isModernYarn(
   return false;
 }
 
+/** Each manager's flag for auditing production dependencies only. */
+const PRODUCTION_FLAGS = {
+  npm: ["--omit=dev"],
+  pnpm: ["--prod"],
+  yarnClassic: ["--groups", "dependencies"],
+  yarnModern: ["--environment", "production"],
+} as const;
+
 export function resolveAuditCommand(
   projectPath: string,
   packageManager?: string,
+  production = false,
 ): AuditCommand {
+  const only = (flags: readonly string[]) => (production ? [...flags] : []);
   const preferredManager = declaredManager(packageManager);
   const lockFile = findLockFile(projectPath, preferredManager);
   const manager = preferredManager ?? lockFile?.manager ?? "npm";
@@ -102,7 +123,7 @@ export function resolveAuditCommand(
     return {
       manager,
       command: executable,
-      args: ["audit", "--json"],
+      args: ["audit", "--json", ...only(PRODUCTION_FLAGS.pnpm)],
       fixCommand: "pnpm audit --fix",
     };
   }
@@ -117,8 +138,14 @@ export function resolveAuditCommand(
       manager,
       command: executable,
       args: modern
-        ? ["npm", "audit", "--json", "--recursive"]
-        : ["audit", "--json"],
+        ? [
+            "npm",
+            "audit",
+            "--json",
+            "--recursive",
+            ...only(PRODUCTION_FLAGS.yarnModern),
+          ]
+        : ["audit", "--json", ...only(PRODUCTION_FLAGS.yarnClassic)],
       fixCommand: modern ? "yarn up <package>" : "yarn upgrade",
     };
   }
@@ -126,7 +153,7 @@ export function resolveAuditCommand(
   return {
     manager,
     command: executable,
-    args: ["audit", "--json"],
+    args: ["audit", "--json", ...only(PRODUCTION_FLAGS.npm)],
     fixCommand: "npm audit fix",
   };
 }
@@ -214,11 +241,19 @@ export interface AuditRun {
 }
 
 export type AuditRunner = (command: AuditCommand, cwd: string) => AuditRun;
+export type AsyncAuditRunner = (
+  command: AuditCommand,
+  cwd: string,
+) => Promise<AuditRun>;
+
+const AUDIT_TIMEOUT_MS = 30_000;
+/** Workspace audits that run at once, so a large monorepo does not flood the registry. */
+const DEFAULT_AUDIT_CONCURRENCY = 4;
 
 const runAuditProcess: AuditRunner = (command, cwd) => {
   const result = spawnSync(command.command, command.args, {
     cwd,
-    timeout: 30000,
+    timeout: AUDIT_TIMEOUT_MS,
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     shell: process.platform === "win32",
@@ -230,8 +265,42 @@ const runAuditProcess: AuditRunner = (command, cwd) => {
   };
 };
 
+const runAuditProcessAsync: AsyncAuditRunner = (command, cwd) =>
+  new Promise((resolve) => {
+    execFile(
+      command.command,
+      command.args,
+      {
+        cwd,
+        timeout: AUDIT_TIMEOUT_MS,
+        encoding: "utf-8",
+        maxBuffer: 64 * 1024 * 1024,
+        shell: process.platform === "win32",
+        windowsHide: true,
+      },
+      (error, stdout, stderr) => {
+        // Audits exit non-zero when they find vulnerabilities; only a
+        // process that could not start or finish is a failure, as with
+        // spawnSync.
+        const failed =
+          error !== null && (error.killed || typeof error.code !== "number");
+        resolve({
+          stdout: stdout ?? "",
+          stderr: stderr ?? "",
+          ...(failed ? { error } : {}),
+        });
+      },
+    );
+  });
+
 type AuditOutcome =
-  | { kind: "summary"; summary: AuditSummary }
+  | {
+      kind: "summary";
+      summary: AuditSummary;
+      advisories?: AuditAdvisory[];
+      /** Set when the result comes from the on-disk cache: when it ran. */
+      cachedAt?: number;
+    }
   | { kind: "error"; message: string };
 
 /**
@@ -270,12 +339,30 @@ function auditCacheKey(
   ].join("\u0000");
 }
 
-function runAudit(
-  projectPath: string,
-  command: AuditCommand,
-  runner: AuditRunner,
-): AuditOutcome {
-  const run = runner(command, projectPath);
+/** A successful audit from the on-disk cache, if one is fresh. */
+function persistedOutcome(file: string | null): AuditOutcome | undefined {
+  const persisted = file ? readPersistedAudit(file) : null;
+  return persisted
+    ? {
+        kind: "summary",
+        summary: persisted.summary,
+        advisories: persisted.advisories,
+        cachedAt: persisted.createdAt,
+      }
+    : undefined;
+}
+
+/** Keeps a successful audit for later scans; failures are retried instead. */
+function persistOutcome(file: string | null, outcome: AuditOutcome): void {
+  if (file && outcome.kind === "summary") {
+    persistAudit(file, {
+      summary: outcome.summary,
+      advisories: outcome.advisories ?? [],
+    });
+  }
+}
+
+function auditOutcome(run: AuditRun, command: AuditCommand): AuditOutcome {
   try {
     if (run.error) throw run.error;
     if (!run.stdout.trim()) {
@@ -283,13 +370,109 @@ function runAudit(
         run.stderr.trim() || `${command.manager} audit returned no JSON`,
       );
     }
-    return { kind: "summary", summary: parseAuditSummary(run.stdout) };
+    return {
+      kind: "summary",
+      summary: parseAuditSummary(run.stdout),
+      advisories: parseAuditAdvisories(run.stdout),
+    };
   } catch (error) {
     return {
       kind: "error",
       message: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+function runAudit(
+  projectPath: string,
+  command: AuditCommand,
+  runner: AuditRunner,
+  cacheFile: string | null,
+): AuditOutcome {
+  const outcome = auditOutcome(runner(command, projectPath), command);
+  persistOutcome(cacheFile, outcome);
+  return outcome;
+}
+
+export interface AuditTarget {
+  projectPath: string;
+  /** Audit only production dependencies, as `audit: production` does. */
+  production: boolean;
+}
+
+interface AuditJob {
+  projectPath: string;
+  command: AuditCommand;
+  key: string;
+  cacheFile: string | null;
+}
+
+function auditJob(target: AuditTarget): AuditJob | null {
+  const projectPath = resolve(target.projectPath);
+  let pkg: PackageJson;
+  try {
+    pkg = JSON.parse(readFileSync(join(projectPath, "package.json"), "utf-8"));
+  } catch {
+    // The scan reports a missing or invalid package.json itself.
+    return null;
+  }
+  const lockFile = findLockFile(
+    projectPath,
+    declaredManager(pkg.packageManager),
+  );
+  if (!lockFile) return null;
+  const command = resolveAuditCommand(
+    projectPath,
+    pkg.packageManager,
+    target.production,
+  );
+  const key = auditCacheKey(projectPath, command, lockFile);
+  return {
+    projectPath,
+    command,
+    key,
+    cacheFile: auditCacheFile(lockFile.directory, key),
+  };
+}
+
+/**
+ * Runs the audits of several projects concurrently, such as the packages of a
+ * workspace, and keeps the outcomes for scans in this process that use
+ * `audit: "cached"`. The audits are what a scan would run; only the waiting
+ * overlaps.
+ */
+export async function prefetchAudits(
+  targets: AuditTarget[],
+  options: { runner?: AsyncAuditRunner; concurrency?: number } = {},
+): Promise<void> {
+  const runner = options.runner ?? runAuditProcessAsync;
+  const jobs = [
+    ...new Map(
+      targets.flatMap((target) => {
+        const job = auditJob(target);
+        return job ? [[job.key, job] as const] : [];
+      }),
+    ).values(),
+  ];
+  let next = 0;
+  const work = async (): Promise<void> => {
+    for (let job = jobs[next++]; job; job = jobs[next++]) {
+      let outcome = persistedOutcome(job.cacheFile);
+      if (!outcome) {
+        outcome = auditOutcome(
+          await runner(job.command, job.projectPath),
+          job.command,
+        );
+        persistOutcome(job.cacheFile, outcome);
+      }
+      auditCache.set(job.key, outcome);
+    }
+  };
+  const workers = Math.min(
+    options.concurrency ?? DEFAULT_AUDIT_CONCURRENCY,
+    jobs.length,
+  );
+  await Promise.all(Array.from({ length: workers }, work));
 }
 
 /** Records an audit outcome's findings and reports whether it passed. */
@@ -308,29 +491,36 @@ function recordAudit(
   }
 
   const { critical, high, moderate, low } = outcome.summary;
+  // Affected packages go in the fix text: messages carry the finding's
+  // identity for baselines and stay unchanged.
+  const affected = (severity: AuditAdvisory["severity"]) =>
+    describeAdvisories(outcome.advisories ?? [], severity);
   if (critical > 0)
     issues.push({
       ...fromRule("vuln-critical"),
       message: `${critical} critical vulnerabilit${critical > 1 ? "ies" : "y"}`,
-      fix: `Run ${auditCommand.fixCommand}`,
+      fix: `Run ${auditCommand.fixCommand}.${affected("critical")}`,
     });
   if (high > 0)
     issues.push({
       ...fromRule("vuln-high"),
       message: `${high} high severity vulnerabilit${high > 1 ? "ies" : "y"}`,
-      fix: `Run ${auditCommand.fixCommand}`,
+      fix: `Run ${auditCommand.fixCommand}.${affected("high")}`,
     });
   if (moderate > 0)
     issues.push({
       ...fromRule("vuln-moderate"),
       message: `${moderate} moderate vulnerabilit${moderate > 1 ? "ies" : "y"}`,
-      fix: `Review ${auditCommand.manager} audit output`,
+      fix: `Review ${auditCommand.manager} audit output.${affected("moderate")}`,
     });
-  if (low > 0)
+  if (low > 0) {
+    const lowAffected = affected("low");
     issues.push({
       ...fromRule("vuln-low"),
       message: `${low} low severity vulnerabilit${low > 1 ? "ies" : "y"}`,
+      ...(lowAffected ? { fix: lowAffected.trim() } : {}),
     });
+  }
   return critical + high + moderate + low === 0;
 }
 
@@ -387,7 +577,11 @@ export async function analyzeDependencies(
   checksRun++;
   const preferredManager = declaredManager(pkg.packageManager);
   const lockFile = findLockFile(projectPath, preferredManager);
-  const auditCommand = resolveAuditCommand(projectPath, pkg.packageManager);
+  const auditCommand = resolveAuditCommand(
+    projectPath,
+    pkg.packageManager,
+    context.config.audit === "production",
+  );
   const hasLock =
     lockFile !== null &&
     (preferredManager === null || lockFile.manager === auditCommand.manager);
@@ -411,24 +605,34 @@ export async function analyzeDependencies(
   // 2. Package manager audit. Audits need a lock file; without one the
   // missing lock file is the finding and the check counts as failed. A
   // deliberately skipped audit is reported but not counted as a check.
-  const auditMode = options.audit ?? context.config.audit;
+  // `audit: production` runs the audit, limited to production dependencies.
+  const auditMode = options.audit ?? context.config.audit !== false;
   const cacheKey = lockFile
     ? auditCacheKey(projectPath, auditCommand, lockFile)
     : null;
-  const cached = cacheKey ? auditCache.get(cacheKey) : undefined;
+  const cacheFile =
+    lockFile && cacheKey && auditMode !== false
+      ? auditCacheFile(lockFile.directory, cacheKey)
+      : null;
+  const persisted = persistedOutcome(cacheFile);
+  const cached = (cacheKey ? auditCache.get(cacheKey) : undefined) ?? persisted;
+  let reusedFrom: number | undefined;
   // Without a lock file no audit can run in any mode; that is a failed check.
   if (auditMode === true || (auditMode === "cached" && (cached || !lockFile))) {
     checksRun++;
     if (lockFile && cacheKey) {
+      // A full scan audits again unless an audit of the same lock file ran
+      // within the hour; editor saves reuse any earlier result.
       const outcome =
-        auditMode === "cached" && cached
-          ? cached
-          : runAudit(
-              projectPath,
-              auditCommand,
-              options.runAudit ?? runAuditProcess,
-            );
+        (auditMode === "cached" ? cached : persisted) ??
+        runAudit(
+          projectPath,
+          auditCommand,
+          options.runAudit ?? runAuditProcess,
+          cacheFile,
+        );
       auditCache.set(cacheKey, outcome);
+      if (outcome.kind === "summary") reusedFrom = outcome.cachedAt;
       if (recordAudit(outcome, auditCommand, issues)) checksPassed++;
     }
   } else {
@@ -488,6 +692,10 @@ export async function analyzeDependencies(
     name: "Dependencies",
     score,
     issues,
-    summary: `${Math.round(checksPassed)}/${checksRun} checks passed`,
+    summary: `${Math.round(checksPassed)}/${checksRun} checks passed${
+      reusedFrom === undefined
+        ? ""
+        : `; audit reused from ${auditAge(reusedFrom)}`
+    }`,
   };
 }

@@ -233,3 +233,84 @@ test("only pull request events have a pull request context", () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("a comparison with the base branch replaces the change since the last run", () => {
+  const compared: ScanResult = {
+    ...result([{ ...XSS, isNew: true }, REDIRECT], 78),
+    comparison: {
+      previousTimestamp: "2026-10-03T00:00:00.000Z",
+      previousScore: 81,
+      previousGrade: "B",
+      scoreDelta: -3,
+      analyzers: [],
+      newFindings: 1,
+      fixedFindings: 2,
+      fixed: [],
+    },
+  };
+  const body = renderPrComment({
+    result: compared,
+    threshold: 70,
+    previousScore: 90,
+    changedFiles: new Set(["src/app.ts", "src/login.ts"]),
+    projectDirectory: "",
+  });
+
+  assert.match(
+    body,
+    /▼ −3 vs\. the base branch \(81\) · 1 new · 2 fixed · threshold 70/,
+  );
+  assert.doesNotMatch(body, /since the last run/);
+  assert.match(
+    body,
+    /\| `src\/app\.ts:12` \| \*\*new\*\* · Request data is written/,
+  );
+  assert.match(body, /\| `src\/login\.ts:4` \| A redirect target/);
+});
+
+test("pull request comment fails when a workspace package misses its threshold", () => {
+  const body = renderPrComment({
+    result: {
+      ...result([], 88),
+      workspace: {
+        tool: "npm",
+        packages: [
+          {
+            path: "packages/api",
+            framework: "express",
+            totalScore: 61,
+            grade: "D",
+            findings: 2,
+            threshold: 70,
+          },
+        ],
+      },
+    },
+    threshold: 80,
+    changedFiles: new Set(),
+    projectDirectory: "",
+  });
+
+  assert.match(body, /^## ❌ CodeDiag: 88\/100/m);
+  assert.match(
+    body,
+    /threshold 80 · below their package threshold: `packages\/api` 61\/70/,
+  );
+});
+
+test("pull request comment fails on findings at or above fail-on", () => {
+  const render = (failOn: "critical" | "warning" | null) =>
+    renderPrComment({
+      result: result([REDIRECT], 95),
+      threshold: 80,
+      failOn,
+      changedFiles: new Set(),
+      projectDirectory: "",
+    });
+
+  assert.match(render(null), /^## ✅ CodeDiag: 95\/100/m);
+  assert.match(render("critical"), /^## ✅ CodeDiag: 95\/100/m);
+  assert.match(render("critical"), /threshold 80 · fails on critical$/m);
+  assert.match(render("warning"), /^## ❌ CodeDiag: 95\/100/m);
+  assert.match(render("warning"), /fails on warning \(1 found\)/);
+});

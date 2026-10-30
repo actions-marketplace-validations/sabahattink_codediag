@@ -20,6 +20,9 @@ The analyzer currently reports:
   files are skipped;
 - secrets in `.env` files that Git tracks (`committed-env-secret`); ignored
   `.env` files are your local configuration and are never read;
+- optionally, secrets that recent commits added and the current tree no
+  longer has (`secret-in-git-history`); see
+  [below](#secrets-in-git-history);
 - JWT options that accept the `none` algorithm or `ignoreExpiration: true`,
   and jose's `UnsecuredJWT`;
 - session or token cookies (names containing session, sid, token, jwt, or
@@ -62,7 +65,8 @@ A dynamic shell or SQL value is critical when it comes from request data:
 `req`/`request`/`ctx` properties, `process.argv`, Next.js `request.json()`,
 or `searchParams`. CodeDiag follows the value back through variable
 declarations, destructuring, and reassignments in the enclosing scopes, up to
-three assignments, so this is critical:
+three assignments, and through the project's helper functions (see
+[below](#helper-functions-and-services)), so this is critical:
 
 ```ts
 const { id } = req.params;
@@ -75,7 +79,17 @@ Other non-literal values are warnings.
 The path traversal, SSRF, open redirect, and XSS checks report only values
 that are request data themselves, followed through the same variables.
 NestJS parameters injected with `@Query()`, `@Param()`, `@Body()`, or
-`@Headers()` are request data too. A
+`@Headers()` are request data too, and so is a tRPC procedure's input inside
+the resolver passed to `.query()`, `.mutation()`, or `.subscription()`:
+`({ input }) => ...` (and fields destructured from it) or `opts.input`.
+Input that passed `.input(schema)` still counts, because the caller chose it:
+
+```ts
+// Critical: z.string() checks the type, not what the shell does with it.
+publicProcedure.input(z.string()).mutation(({ input }) => exec(`gzip ${input}`));
+```
+
+A
 function's result is not request data, so `db.find(req.params.id)` and
 `await repo.pathFor(req.params.id)` are not reported, and neither are values
 wrapped in `path.basename()`, `encodeURIComponent()`, `Number()`, or an
@@ -100,9 +114,121 @@ Path traversal and reflected XSS are critical. SSRF and open redirects are
 warnings, because fetching or redirecting to a user-supplied URL is
 sometimes the feature (webhooks, link previews, sign-in return URLs); add an
 allowlist and suppress the finding with the reason. Dynamic code execution and disabled
-TLS verification are always critical. Taint tracking stays within a function
-and its enclosing scopes; values passed through helper functions are not
-followed yet (see the [roadmap](roadmap.md)).
+TLS verification are always critical.
+
+### Helper functions and services
+
+Request data is also followed through the project's own functions, across
+files:
+
+- **Into helpers.** When a sink's value comes from a parameter of a project
+  function, CodeDiag checks the function's call sites. If one passes request
+  data for that parameter, the sink is reported. This covers plain and arrow
+  functions, imports (named, default, renamed, namespace, and `require()`),
+  object methods, and class methods called on an instance or through
+  `this.service.method()`, including NestJS services injected through the
+  constructor.
+- **Out of helpers.** A project function whose returned value is request
+  data makes its result request data: `function getName(req) { return
+  req.query.name; }` or `const pick = (query) => query.file` called with
+  `req.query`. Other results still are not request data, so a database
+  lookup, `basename()`, `Number()`, or an escaping function inside the helper
+  ends the trace.
+
+```ts
+// src/lib/files.ts: reported here, at the file call
+export function readUpload(name: string) {
+  return fs.readFile(path.join(UPLOADS, name));
+}
+// src/routes/files.ts
+app.get("/f", (req, res) => readUpload(req.query.name));
+```
+
+The finding stays at the sink, with the same message, so suppressions and
+fingerprints stay where the dangerous call is. It has medium confidence, and
+when a caller passes the data in, its fix names that call: "Request data
+reaches this call from src/routes/files.ts:12; ...". A shell or SQL warning
+that becomes critical this way is still one finding. URL and HTML sinks judge
+what each caller passes as a whole, so
+``apiGet(`https://api.example.com/users/${id}`)`` keeps the origin fixed
+inside `apiGet(url)`, and `reply(res, req.body)` still counts as JSON.
+
+Functions are resolved with TypeScript's type checker. Only functions in the
+scanned runtime files are followed (never `node_modules`, declaration files,
+or tests), calls from test files do not count, and a trace crosses at most
+two function boundaries, such as a route calling a helper that calls another
+helper. A helper that only ever receives constants is not upgraded.
+
+### Secrets in Git history
+
+Deleting a committed key does not remove it from the repository: every clone
+and fork still has it. The history scan reports such keys. It is off by
+default, because its result depends on how much history the checkout has
+(CI checkouts are usually shallow), and a baseline or `--compare` report
+made on a full clone would not match one made in CI. Turn it on in
+`.codediag.yml`, on the command line, or with the Action's `secret-history`
+input:
+
+```yaml
+secretHistory: true   # the last 1000 commits; or a number, such as 5000
+```
+
+```bash
+codediag scan . --secret-history        # 1000 commits
+codediag scan . --secret-history 5000
+```
+
+CodeDiag runs `git log --patch` on the checked-out branch (`HEAD`, not other
+branches or tags), limited to the project directory and to the most recent
+commits that touch it, without merge commits, and reads only the lines each
+commit adds:
+
+- provider formats (private keys, AWS, GitHub, Stripe live, Slack, npm,
+  Google, Anthropic, OpenAI, and SendGrid keys, and database URLs with a
+  password) in any text file;
+- in configuration files, `.npmrc`, `.yarnrc`, and `.env` files, also
+  long, random values of keys such as `password` or `token`, with the same
+  rules as the current-tree scan.
+
+`ignore` patterns, `node_modules`, `dist`, and other output directories,
+minified files, source maps, lock files, and binary files are skipped. A
+private key counts only with its key material (a BEGIN line, base64, and an
+END line), so code that merely mentions `-----BEGIN PRIVATE KEY-----` is not
+reported, and the same key is recognized as a PEM file and as a JSON string.
+
+A secret is reported only when the files Git tracks no longer contain it;
+otherwise `hardcoded-secret` or `committed-env-secret` already covers it.
+Secrets are compared by digest in memory and never stored or printed. A
+`.env` file removed with `git rm --cached` counts as removed, even though
+your local copy still has the value. Each secret is reported once per file,
+at the oldest commit that added it:
+
+```text
+An AWS access key was committed to config/production.json in 1a2b3c4 (2024-03-05) and remains in Git history after its removal
+```
+
+The fix is to revoke or rotate the credential. Rewriting history with
+`git filter-repo` keeps it out of future clones, but every existing clone,
+fork, and cache still has it.
+
+The fingerprint of a history finding is based on its message: the kind of
+secret, the file, and the commit. Baselines and `--compare` therefore keep
+matching across scans, but a history rewrite that keeps the secret (a rebase
+or `git filter-repo` for other reasons) gives the commit a new SHA, and the
+finding a new fingerprint. A fingerprint never contains a digest of the
+secret, which could be used to confirm a guessed password offline.
+
+The Security summary says how much history was read, for example
+`Git history: 1000 commits scanned` or, when the limit cut history off,
+`Git history: the most recent 1000 commits scanned`. In a shallow clone it
+adds that history is partial; the oldest commit there shows the whole tree
+as added, so a finding from it says "was in ... at <commit>, the oldest
+commit of this shallow clone" instead of naming the commit that introduced
+the secret. Outside a Git repository, or before the first commit, nothing is
+read or reported. `git log` output is limited to 64 MiB and 60 seconds; if
+either limit stops it, the findings cover the commits that were read and an
+`info` finding, `secret-history-incomplete`, says so. The VS Code extension
+never reads history.
 
 ## Scope
 
@@ -135,10 +261,24 @@ Run `codediag explain <rule>` for any rule's details.
 ## Limits
 
 The analysis is intentionally conservative. It does not perform whole-program
-taint tracking, inspect Git history for removed secrets, prove authorization
-correctness, or replace dependency advisories and a full SAST review. Dynamic
-imports, wrapper functions, custom database APIs, and values assembled across
-multiple modules may not be recognized.
+taint tracking, read Git history unless asked to (and then only the
+checked-out branch), prove authorization correctness, or replace dependency
+advisories and a full SAST review. Dynamic
+imports, custom database APIs, and values assembled in other ways may not be
+recognized. Across functions in particular, CodeDiag does not follow:
+
+- chains longer than two calls, constructors, callbacks passed to other
+  functions (`items.map(helper)`), `.call()`/`.apply()`/`.bind()`, rest
+  parameters, or spread arguments;
+- calls that cannot be matched to the function: methods on a value whose
+  type is unknown (an untyped JavaScript parameter), methods reached through
+  an interface or a dependency injection token instead of the class, and
+  calls through a name re-exported under an alias;
+- request data stored on an object (`this.name = req.query.name`) or in
+  module state and read elsewhere;
+- a whole request object passed to a helper under another name, unless the
+  helper reads `body`, `params`, or `query` from it (`function f(r) { return
+  r.query.name; }` is followed; `r.headers.host` is not).
 
 Treat findings as review prompts with source locations and fixes. A clean scan
 means the implemented checks passed; it is not proof that an application is
