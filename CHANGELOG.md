@@ -2,6 +2,114 @@
 
 All notable changes to CodeDiag are documented in this file.
 
+## [0.8.0] - 2026-10-30
+
+The "Depth" release: tRPC procedures, request data followed through fields,
+constructors, callbacks, and injected providers, `fastify-cli` projects as
+`@fastify/autoload` loads them, secrets that Git history still holds, gates
+that a good average cannot hide, and fixes you apply from the editor.
+
+### Added
+
+- tRPC API Health analysis: procedures from `initTRPC` instances are
+  followed through `.use()`/`.input()` builder chains, exported and
+  destructured builders (`publicProcedure`, `protectedProcedure`, T3's
+  `createTRPCRouter`), nested, record, and merged routers, and imports across
+  files, including tsconfig `paths` such as `~/`. New warnings:
+  `missing-trpc-auth-middleware` (mutations whose middleware never rejects
+  anonymous callers; a `protectedProcedure` is judged by its middleware, not
+  its name), `unvalidated-trpc-input` (`z.any()`, `z.unknown()`,
+  `z.custom()`, Valibot `any`/`unknown`, or `(v) => v as T` parsers), and
+  `trpc-stack-trace-exposed` (`isDev: true`, or an `errorFormatter` that
+  returns `error.stack` unconditionally). The checks join the API Health
+  result of the server that runs tRPC (Next.js, Express, Fastify, Hono,
+  NestJS); a server whose only endpoints are tRPC procedures, such as a T3
+  App Router project, is no longer reported as having none, and a standalone
+  tRPC server is detected as `trpc`.
+- tRPC procedure input (`({ input })`, `opts.input`) is request data for the
+  security sink rules, even after `.input(schema)` validation, and is
+  followed into helpers and services two calls deep.
+- Taint through object state: request data a class stores on `this` (in its
+  constructor, a method, or a field initializer, including TypeScript
+  parameter properties) reaches sinks that read the field in another member,
+  and a `new` expression that passes request data to a constructor taints
+  the fields set from that parameter, through imports and `require()`. A
+  write earlier in the reading method's own code overrides writes elsewhere.
+- Taint through callbacks: elements of request data flow into inline
+  `forEach`, `map`, `filter`, `some`, `every`, `find`, `findIndex`,
+  `findLast`, `findLastIndex`, `flatMap`, `reduce`, and `reduceRight`
+  callbacks, `for...of` variables, and `then()` callbacks; a project function
+  that invokes a callback written inline at its call site is followed for
+  that call only.
+- Methods reached through a project interface or abstract class, or through a
+  NestJS `@Inject()` token, resolve to their one implementation via
+  `implements`/`extends` clauses and `{ provide, useClass }` providers;
+  ambiguous cases are not followed. Findings traced through fields,
+  constructors, project callbacks, or injected providers keep their sink
+  line, message, and fingerprint, get `confidence: "medium"`, and name where
+  request data enters.
+- `secret-in-git-history` (critical, opt-in): credentials that commits on
+  the checked-out branch added and the current tree no longer has, which
+  every clone still contains. Turn it on with `secretHistory: true` (the last
+  1000 commits) or a commit count in `.codediag.yml`, `--secret-history
+  [commits]`, or the Action's `secret-history` input (with `actions/checkout`
+  `fetch-depth: 0`). Added lines are checked with the same detectors as the
+  current tree; secrets are compared by digest in memory and never stored or
+  printed, and fingerprints are based on the commit, not the secret. The
+  Security summary says how much history was read and flags shallow clones,
+  and `secret-history-incomplete` (info) notes a scan cut short by its 64 MiB
+  or 60-second limit.
+- Fastify projects that load plugins with `@fastify/autoload` (the layout
+  `fastify-cli` generates) are analyzed as they run: autoloaded plugins share
+  the context that registers autoload, directory names become route
+  prefixes, `autoPrefix` and `prefixOverride` exports and `options.prefix`
+  apply, an index file replaces the other files of its directory, and with
+  `autoHooks` a directory's autohooks protect its routes (and its
+  subdirectories' with `cascadeHooks`). Directories may be given with
+  `__dirname`, `import.meta.dirname`, `dirname(fileURLToPath(import.meta.url))`,
+  or `new URL(..., import.meta.url)`. Such projects previously got
+  unprefixed, low-confidence routes and missing-auth findings for routes
+  their autohooks protect.
+- `packageThreshold` in `.codediag.yml`, `--package-threshold`, and the
+  Action's `package-threshold` input gate every package of a `--workspaces`
+  scan on its own score, so one weak package cannot hide behind the combined
+  average. A package's own `.codediag.yml` can set its own value. Failing
+  packages are named on stderr, in error annotations and the job summary,
+  and marked in the terminal, Markdown, HTML, and pull request comment
+  reports; the JSON report records each package's `threshold`.
+- `failOn` in `.codediag.yml`, `--fail-on`, and the Action's `fail-on` input
+  fail the scan on any active finding at or above `critical`, `warning`, or
+  `info`, whatever the score. Suppressed and baseline findings do not count,
+  and with `--changed-since` only the changed files do.
+- VS Code extension 0.6.0: remediation quick fixes, offered as the preferred
+  fix where a rule has one mechanical fix on the flagged line: enable TLS
+  certificate verification, verify JWT expiration, and remove `"none"` from a
+  JWT `algorithms` list.
+
+### Known limitations
+
+- tRPC: auth applied outside the procedure (at the adapter mount, in a
+  Next.js `middleware.ts`, or by a throwing `createContext`) is not seen,
+  intentionally public mutations are reported like any other, and tRPC v9
+  routers are not supported.
+- Git history secrets: only the checked-out branch is read, merge commits are
+  skipped, and a history rewrite that keeps a secret changes its fingerprint.
+- Field taint is instance-insensitive: any `new X(requestData)` taints `X`'s
+  fields. Fields written by a base class or from outside the class,
+  `super()` calls, and `Object.assign(this, ...)` are not followed.
+
+### Fixed
+
+- Shell command and SQL findings did not count NestJS `@Param()`,
+  `@Query()`, `@Body()`, or `@Headers()` parameters as request data unless
+  their text named the request, so they stayed warnings. Parameters behind a
+  parsing pipe (`ParseIntPipe`, `ParseUUIDPipe`, ...) are no longer request
+  data for any sink.
+- GitHub Action annotation messages escaped commas and colons as workflow
+  command properties do, so GitHub showed them as `%2C` and `%3A`; only
+  properties are escaped that way now.
+- The JSON schema rejected combined workspace reports with a Hono package.
+
 ## [0.7.0] - 2026-10-30
 
 The "Across" release: request data is followed through helper functions and

@@ -1,7 +1,8 @@
-import { posix } from "node:path";
+import { posix, relative, resolve } from "node:path";
 import {
   type ArrowFunction,
   type CallExpression,
+  type CompilerOptions,
   type FunctionDeclaration,
   type FunctionExpression,
   Node,
@@ -56,10 +57,20 @@ export interface PluginTarget {
   encapsulated: boolean;
 }
 
+/** A tsconfig `paths` pattern such as `~/*`, with project-relative targets. */
+export interface PathAlias {
+  prefix: string;
+  suffix: string;
+  /** Targets with `*` where the matched part goes: `src/*`. */
+  targets: readonly string[];
+}
+
 /** Project files by path, for following imports between them. */
 export interface ModuleIndex {
   readonly paths: ReadonlyMap<SourceFile, string>;
   readonly files: ReadonlyMap<string, SourceFile>;
+  /** Non-relative specifiers to follow, such as `~/server/db`. */
+  readonly aliases?: readonly PathAlias[];
 }
 
 export interface ProjectIndex extends ModuleIndex {
@@ -179,26 +190,86 @@ export function moduleOf(node: Node): string | null {
   return declaration ? (importSource(declaration)?.specifier ?? null) : null;
 }
 
+/**
+ * The project-relative tsconfig `paths` of a project, from compiler options
+ * whose targets are relative to `baseUrl` or the tsconfig's directory.
+ */
+export function pathAliases(
+  options: CompilerOptions,
+  projectPath: string,
+): PathAlias[] {
+  const base =
+    options.baseUrl ??
+    (typeof options.pathsBasePath === "string"
+      ? options.pathsBasePath
+      : projectPath);
+  return Object.entries(options.paths ?? {}).flatMap(([pattern, targets]) => {
+    const [prefix = "", suffix = "", ...rest] = pattern.split("*");
+    if (rest.length > 0) return [];
+    return [
+      {
+        prefix,
+        suffix,
+        targets: targets.map((target) =>
+          relative(projectPath, resolve(base, target)).replace(/\\/g, "/"),
+        ),
+      },
+    ];
+  });
+}
+
+/** Project-relative bases a specifier can name: relative or through an alias. */
+function importBases(
+  index: ModuleIndex,
+  fromFile: string,
+  specifier: string,
+): string[] {
+  if (specifier.startsWith(".")) {
+    return [posix.normalize(posix.join(posix.dirname(fromFile), specifier))];
+  }
+  return (index.aliases ?? []).flatMap(({ prefix, suffix, targets }) => {
+    if (
+      specifier.length < prefix.length + suffix.length ||
+      !specifier.startsWith(prefix) ||
+      !specifier.endsWith(suffix)
+    ) {
+      return [];
+    }
+    const matched = specifier.slice(
+      prefix.length,
+      specifier.length - suffix.length,
+    );
+    return targets.map((target) =>
+      posix.normalize(target.replace("*", matched)),
+    );
+  });
+}
+
 function resolveImport(
   index: ModuleIndex,
   from: SourceFile,
   specifier: string,
 ): SourceFile | undefined {
   const fromFile = index.paths.get(from);
-  if (!fromFile || !specifier.startsWith(".")) return undefined;
-  const base = posix.normalize(posix.join(posix.dirname(fromFile), specifier));
-  const stem = base.replace(/\.(?:[cm]?js|jsx)$/, "");
-  const candidates = [
-    base,
-    ...MODULE_EXTENSIONS.map((extension) => `${stem}${extension}`),
-    ...MODULE_EXTENSIONS.map((extension) => `${base}/index${extension}`),
-  ];
-  const match = candidates.find((candidate) => index.files.has(candidate));
-  return match ? index.files.get(match) : undefined;
+  if (!fromFile) return undefined;
+  for (const base of importBases(index, fromFile, specifier)) {
+    const stem = base.replace(/\.(?:[cm]?js|jsx)$/, "");
+    const candidates = [
+      base,
+      ...MODULE_EXTENSIONS.map((extension) => `${stem}${extension}`),
+      ...MODULE_EXTENSIONS.map((extension) => `${base}/index${extension}`),
+    ];
+    const match = candidates.find((candidate) => index.files.has(candidate));
+    if (match) return index.files.get(match);
+  }
+  return undefined;
 }
 
 /** The node a module exports under a name ("default" for module.exports). */
-function exportedValue(sourceFile: SourceFile, name: string): Node | undefined {
+export function exportedValue(
+  sourceFile: SourceFile,
+  name: string,
+): Node | undefined {
   const isDefault = name === "default";
   const fn = sourceFile
     .getFunctions()
@@ -424,6 +495,16 @@ function declaredPlugins(
 }
 
 /**
+ * The plugins a register() call loads when its first argument is not a
+ * plugin function, such as @fastify/autoload loading a directory; null
+ * falls back to the argument itself.
+ */
+export type RegisteredPlugins = (
+  index: ProjectIndex,
+  call: CallExpression,
+) => ReadonlyArray<PluginTarget> | null;
+
+/**
  * Indexes instances and plugins: typed `(fastify: FastifyInstance)` and
  * FastifyPlugin* functions, fastify-plugin arguments, and anything an
  * instance registers. Registration repeats until no new plugin is found,
@@ -431,6 +512,7 @@ function declaredPlugins(
  */
 export function createProjectIndex(
   sources: ReadonlyArray<{ file: string; sourceFile: SourceFile }>,
+  registeredPlugins: RegisteredPlugins = () => null,
 ): ProjectIndex {
   const roots = new Map<Node, string>();
   const plugins = new Map<Node, string>();
@@ -463,11 +545,12 @@ export function createProjectIndex(
   while (changed) {
     changed = false;
     for (const call of registers) {
-      if (
-        instanceOf(index, receiverOf(call)) &&
-        add(pluginTarget(index, call.getArguments()[0]))
-      ) {
-        changed = true;
+      if (!instanceOf(index, receiverOf(call))) continue;
+      const targets = registeredPlugins(index, call) ?? [
+        pluginTarget(index, call.getArguments()[0]),
+      ];
+      for (const target of targets) {
+        if (add(target)) changed = true;
       }
     }
   }

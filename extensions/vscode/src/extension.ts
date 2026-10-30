@@ -163,6 +163,9 @@ async function runScan(
         async (progress) => {
           const options = {
             interactive: false,
+            // Git history findings depend on the clone and are slow to
+            // compute; the editor shows the working tree only.
+            secretHistory: false as const,
             // Saves trigger frequent scans: reuse the last audit of the same
             // lock file instead of blocking on the network.
             ...(trigger === "save" ? { audit: "cached" as const } : {}),
@@ -227,12 +230,30 @@ async function openGeneratedDocument(
 function codeAction(
   fix: QuickFix,
   diagnostic: vscode.Diagnostic,
+  document: vscode.TextDocument,
 ): vscode.CodeAction {
   const action = new vscode.CodeAction(
     fix.title,
     vscode.CodeActionKind.QuickFix,
   );
   action.diagnostics = [diagnostic];
+  if (fix.kind === "remediate") {
+    // A remediation is the fix the rule asks for; the next scan confirms it.
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(
+      document.uri,
+      new vscode.Range(
+        fix.edit.line,
+        fix.edit.start,
+        fix.edit.line,
+        fix.edit.end,
+      ),
+      fix.edit.text,
+    );
+    action.edit = edit;
+    action.isPreferred = true;
+    return action;
+  }
   // Suppressing is a deliberate decision, never the automatic fix.
   action.isPreferred = false;
   action.command =
@@ -260,7 +281,7 @@ const quickFixProvider: vscode.CodeActionProvider = {
     const text = document.getText();
     return findings.flatMap((diagnostic) =>
       quickFixes(diagnostic.finding, text).map((fix) =>
-        codeAction(fix, diagnostic),
+        codeAction(fix, diagnostic, document),
       ),
     );
   },

@@ -5,6 +5,7 @@ export interface StackInfo {
     | "express"
     | "fastify"
     | "hono"
+    | "trpc"
     | "generic"
     | "unknown";
   language: "typescript" | "javascript";
@@ -104,6 +105,8 @@ export interface WorkspacePackageSummary {
   grade: Grade;
   /** Active findings in the package. */
   findings: number;
+  /** The minimum score the package must reach, when one is configured. */
+  threshold?: number;
 }
 
 /** Present on a combined report from a `--workspaces` scan. */
@@ -177,6 +180,13 @@ export interface PackageJson {
 
 export interface CodediagConfig {
   threshold: number;
+  /**
+   * The minimum score of every package in a `--workspaces` scan, or null.
+   * A package's own .codediag.yml can set its own.
+   */
+  packageThreshold: number | null;
+  /** Fails the scan on any active finding at or above this severity. */
+  failOn: DiagnosticIssue["severity"] | null;
   ignore: string[];
   maxFileSizeKb: number;
   scoring: { version: ScoringVersion };
@@ -186,6 +196,11 @@ export interface CodediagConfig {
    * audits only the dependencies that ship, not devDependencies.
    */
   audit: boolean | "production";
+  /**
+   * The number of recent commits whose added lines are searched for secrets
+   * that are no longer in the current tree, or false to skip Git history.
+   */
+  secretHistory: false | number;
   analyzers: {
     api: boolean;
     security: boolean;
@@ -195,15 +210,22 @@ export interface CodediagConfig {
   };
 }
 
+/** Commits searched when `secretHistory: true` or `--secret-history` has no count. */
+export const DEFAULT_SECRET_HISTORY_COMMITS = 1000;
+export const MAX_SECRET_HISTORY_COMMITS = 100_000;
+
 export type AnalyzerKey = keyof CodediagConfig["analyzers"];
 
 export const DEFAULT_CONFIG: CodediagConfig = {
   threshold: 70,
+  packageThreshold: null,
+  failOn: null,
   ignore: ["node_modules", "dist", ".git", "coverage"],
   maxFileSizeKb: 512,
   scoring: { version: 2 },
   rules: {},
   audit: true,
+  secretHistory: false,
   analyzers: {
     api: true,
     security: true,

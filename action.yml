@@ -11,6 +11,13 @@ inputs:
     description: Minimum passing score from 0 to 100.
     required: false
     default: "70"
+  fail-on:
+    description: >-
+      Fail on any active finding at or above this severity (critical,
+      warning, or info), whatever the score. Overrides `failOn` in
+      .codediag.yml. Suppressed and baseline findings do not count.
+    required: false
+    default: ""
   report:
     description: JSON report path, relative to the repository workspace.
     required: false
@@ -40,6 +47,22 @@ inputs:
       relative to `path`.
     required: false
     default: "false"
+  package-threshold:
+    description: >-
+      With `workspaces: true`, the minimum score of every workspace package.
+      A package below it fails the job even when the combined score passes.
+      Overrides `packageThreshold` in .codediag.yml.
+    required: false
+    default: ""
+  secret-history:
+    description: >-
+      Also report secrets that recent commits added and the current tree no
+      longer has: `true` reads the last 1000 commits, a number sets the
+      limit, and `false` turns off `secretHistory` from .codediag.yml. Empty
+      uses the configuration. Needs actions/checkout with `fetch-depth: 0`;
+      a shallow checkout only has its most recent commits.
+    required: false
+    default: ""
   comment:
     description: >-
       Post one pull request comment with the score, its change since the last

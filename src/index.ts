@@ -2,7 +2,17 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import chalk from "chalk";
 import { Command } from "commander";
-import { isBelowThreshold, loadConfig, parseThreshold } from "./config.js";
+import {
+  failOnMessage,
+  findingsAtOrAbove,
+  isBelowThreshold,
+  loadConfig,
+  packagesBelowThreshold,
+  packageThresholdMessage,
+  parseFailOn,
+  parseSecretHistory,
+  parseThreshold,
+} from "./config.js";
 import { loadBaseline } from "./core/baseline.js";
 import { changedFilesSince } from "./core/changed-files.js";
 import { compareWithPrevious, loadReport } from "./core/compare.js";
@@ -43,7 +53,7 @@ program
   .description(
     chalk.bold("codediag") +
       " \u2014 Diagnose your code before you ship.\n\n" +
-      "  Automated project health scanner for NestJS, Express, Fastify, Hono, and Next.js.\n" +
+      "  Automated project health scanner for NestJS, Express, Fastify, Hono, tRPC, and Next.js.\n" +
       "  https://github.com/sabahattink/codediag",
   )
   .version(getPackageVersion(), "-v, --version");
@@ -58,6 +68,10 @@ program
     "terminal",
   )
   .option("-t, --threshold <number>", "Minimum passing score")
+  .option(
+    "--fail-on <severity>",
+    "Fail on any active finding at or above a severity: critical, warning, or info",
+  )
   .option(
     "--ci",
     "CI mode: JSON output unless --format is given, and enforce the threshold",
@@ -89,6 +103,14 @@ program
     "--workspaces",
     "Scan every workspace package (npm, pnpm, Yarn, Lerna, Nx) and combine the reports",
   )
+  .option(
+    "--package-threshold <number>",
+    "With --workspaces, the minimum score of every package",
+  )
+  .option(
+    "--secret-history [commits]",
+    "Also report secrets that recent commits added and the current tree no longer has (default: 1000 commits)",
+  )
   .action(async (path: string, options, command: Command) => {
     const targetPath = resolve(path);
     // --ci implies JSON only when no output format was chosen explicitly.
@@ -110,6 +132,17 @@ program
           : options.ci || hasConfig
             ? config.threshold
             : null;
+      const failOn =
+        options.failOn !== undefined
+          ? parseFailOn(options.failOn)
+          : config.failOn;
+      const packageThreshold =
+        options.packageThreshold !== undefined
+          ? parseThreshold(options.packageThreshold, "package threshold")
+          : undefined;
+      if (packageThreshold !== undefined && !options.workspaces) {
+        throw new Error("--package-threshold needs --workspaces");
+      }
       if (options.changedSince && options.updateBaseline) {
         throw new Error(
           "--update-baseline records the whole project and cannot be combined with --changed-since",
@@ -144,10 +177,18 @@ program
         // --no-audit overrides the config; otherwise the config decides.
         audit:
           command.getOptionValueSource("audit") === "cli" ? false : undefined,
+        // --secret-history overrides the config; otherwise the config decides.
+        secretHistory:
+          options.secretHistory === undefined
+            ? undefined
+            : parseSecretHistory(options.secretHistory),
       };
       const scanned =
         options.workspaces && workspaces
-          ? await scanWorkspace(targetPath, config, workspaces, scanOptions)
+          ? await scanWorkspace(targetPath, config, workspaces, {
+              ...scanOptions,
+              packageThreshold,
+            })
           : await scan(targetPath, config, scanOptions);
       const compared = previous
         ? compareWithPrevious(scanned, previous, scope?.files)
@@ -207,8 +248,24 @@ program
           break;
       }
 
+      // stderr keeps machine-readable formats on stdout intact.
+      const failingPackages = packagesBelowThreshold(result.workspace);
+      for (const entry of failingPackages) {
+        console.error(chalk.red(`  ${packageThresholdMessage(entry)}`));
+      }
+      const blocking = findingsAtOrAbove(result.analyzers, failOn);
+      if (failOn && blocking.length > 0) {
+        console.error(
+          chalk.red(
+            `  ${failOnMessage(blocking.length, failOn)} (fail-on: ${failOn})`,
+          ),
+        );
+      }
       process.exitCode =
-        threshold !== null && isBelowThreshold(result.totalScore, threshold)
+        (threshold !== null &&
+          isBelowThreshold(result.totalScore, threshold)) ||
+        failingPackages.length > 0 ||
+        blocking.length > 0
           ? 1
           : 0;
     } catch (err) {
@@ -242,6 +299,9 @@ program
 
 threshold: 70
 
+# Fail on any active finding at or above a severity, whatever the score.
+# failOn: critical
+
 scoring:
   version: 2
 
@@ -265,6 +325,10 @@ analyzers:
 
 # Code files larger than this are skipped (KiB).
 # maxFileSizeKb: 512
+
+# Also report secrets that were committed and later removed: true reads the
+# last 1000 commits, or give a number. Needs full Git history in CI.
+# secretHistory: false
 `;
 
     writeFileSync(configPath, template, "utf-8");

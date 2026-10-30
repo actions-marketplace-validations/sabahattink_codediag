@@ -4,11 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  failOnMessage,
+  findingsAtOrAbove,
   isBelowThreshold,
   loadConfig,
   normalizeIgnorePatterns,
+  parseFailOn,
+  parseSecretHistory,
   parseThreshold,
 } from "../src/config.js";
+import type { AnalyzerResult } from "../src/types.js";
 
 function withProject(run: (directory: string) => void): void {
   const directory = mkdtempSync(join(tmpdir(), "codediag-config-"));
@@ -129,6 +134,24 @@ test("threshold parsing and comparison are deterministic", () => {
   assert.throws(() => parseThreshold("80x"), /threshold must be an integer/);
 });
 
+test("loads and validates the workspace package threshold", () => {
+  withProject((directory) => {
+    assert.equal(loadConfig(directory).packageThreshold, null);
+    writeFileSync(join(directory, ".codediag.yml"), "packageThreshold: 60\n");
+    assert.equal(loadConfig(directory).packageThreshold, 60);
+    for (const value of ["101", "-1", "6.5", '"60"']) {
+      writeFileSync(
+        join(directory, ".codediag.yml"),
+        `packageThreshold: ${value}\n`,
+      );
+      assert.throws(
+        () => loadConfig(directory),
+        /packageThreshold must be an integer between 0 and 100/,
+      );
+    }
+  });
+});
+
 test("loads and validates the audit switch", () => {
   withProject((directory) => {
     assert.equal(loadConfig(directory).audit, true);
@@ -142,4 +165,102 @@ test("loads and validates the audit switch", () => {
       /audit must be true, false, or production/,
     );
   });
+});
+
+test("loads and validates the fail-on severity", () => {
+  withProject((directory) => {
+    assert.equal(loadConfig(directory).failOn, null);
+    for (const severity of ["critical", "warning", "info"]) {
+      writeFileSync(join(directory, ".codediag.yml"), `failOn: ${severity}\n`);
+      assert.equal(loadConfig(directory).failOn, severity);
+    }
+    writeFileSync(join(directory, ".codediag.yml"), "failOn: error\n");
+    assert.throws(
+      () => loadConfig(directory),
+      /failOn must be critical, warning, or info/,
+    );
+  });
+  assert.equal(parseFailOn("warning"), "warning");
+  assert.throws(
+    () => parseFailOn("high"),
+    /must be critical, warning, or info/,
+  );
+});
+
+test("fail-on counts active findings at or above the severity", () => {
+  const analyzers = [
+    {
+      name: "Security",
+      score: 50,
+      summary: "",
+      issues: [
+        { severity: "critical", rule: "a", message: "a" },
+        { severity: "warning", rule: "b", message: "b" },
+        { severity: "info", rule: "c", message: "c" },
+        {
+          severity: "critical",
+          rule: "d",
+          message: "d",
+          suppression: { kind: "inSource", justification: "reviewed" },
+        },
+        { severity: "critical", rule: "e", message: "e", baseline: true },
+      ],
+    },
+  ] satisfies AnalyzerResult[];
+
+  assert.deepEqual(
+    findingsAtOrAbove(analyzers, "critical").map((issue) => issue.rule),
+    ["a"],
+  );
+  assert.deepEqual(
+    findingsAtOrAbove(analyzers, "warning").map((issue) => issue.rule),
+    ["a", "b"],
+  );
+  assert.equal(findingsAtOrAbove(analyzers, "info").length, 3);
+  assert.equal(findingsAtOrAbove(analyzers, null).length, 0);
+  assert.equal(
+    failOnMessage(2, "warning"),
+    "2 active findings at or above warning severity",
+  );
+  assert.equal(
+    failOnMessage(1, "critical"),
+    "1 active finding at or above critical severity",
+  );
+});
+
+test("loads and validates the secret history setting", () => {
+  withProject((directory) => {
+    const write = (value: string) =>
+      writeFileSync(
+        join(directory, ".codediag.yml"),
+        `secretHistory: ${value}\n`,
+      );
+    assert.equal(loadConfig(directory).secretHistory, false);
+    write("false");
+    assert.equal(loadConfig(directory).secretHistory, false);
+    write("true");
+    assert.equal(loadConfig(directory).secretHistory, 1000);
+    write("250");
+    assert.equal(loadConfig(directory).secretHistory, 250);
+    for (const invalid of ["0", "-5", "2.5", "100001", "all", '"500"']) {
+      write(invalid);
+      assert.throws(
+        () => loadConfig(directory),
+        /Invalid \.codediag\.yml: secretHistory must be true, false, or a number of commits from 1 to 100000/,
+        invalid,
+      );
+    }
+  });
+});
+
+test("parses the --secret-history commit count", () => {
+  assert.equal(parseSecretHistory(true), 1000);
+  assert.equal(parseSecretHistory("40"), 40);
+  for (const invalid of ["", "0", "1e3", "12abc", "100001", "."]) {
+    assert.throws(
+      () => parseSecretHistory(invalid),
+      /--secret-history must be a number of commits from 1 to 100000/,
+      invalid,
+    );
+  }
 });

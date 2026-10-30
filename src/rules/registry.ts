@@ -34,6 +34,11 @@ export interface RuleDefinition {
    * count (more vulnerabilities) is a new finding for baselines.
    */
   countsAreIdentity?: boolean;
+  /**
+   * Findings in a file without a line are told apart by their message (such
+   * as the commit it names), so fingerprints include it.
+   */
+  messageIsIdentity?: boolean;
 }
 
 export const RULES_DOCUMENT_URL =
@@ -213,6 +218,34 @@ export const RULES = {
       "No app.onError() handler was found. Hono's default handler logs the error and replies with a plain-text 500, so clients get a response that does not match the API's error format and errors reach no logger or error tracker beyond the console.",
     defaultSeverity: "info",
   },
+  // API Health: tRPC
+  "missing-trpc-auth-middleware": {
+    analyzer: "API Health",
+    title: "tRPC mutation without auth middleware",
+    description:
+      "A tRPC mutation is built on a procedure whose .use() middleware chain has no recognizable authentication: no middleware throws a TRPCError with code UNAUTHORIZED or FORBIDDEN, throws when ctx.session, ctx.user, or ctx.auth is missing, or is named like an auth check. Builders are followed through variables and imports to t.procedure, so a builder named protectedProcedure is judged by its middleware, and a .use() whose result is discarded protects nothing, because builders are immutable. Queries and subscriptions are not reported. Findings about builders or middleware imported from packages rely on names and have low confidence.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "unvalidated-trpc-input": {
+    analyzer: "API Health",
+    title: "tRPC input without validation",
+    description:
+      "A tRPC procedure's .input() parser accepts every value: z.any(), z.unknown(), or z.custom() without a check (also when optional, nullable, or defaulted), Valibot's any() or unknown(), or a parser function that only returns its argument, such as (value) => value as Input. The resolver's input is typed but never checked.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
+  "trpc-stack-trace-exposed": {
+    analyzer: "API Health",
+    title: "tRPC errors expose stack traces",
+    description:
+      "The initTRPC instance is created with isDev: true, or with an errorFormatter that returns error.stack outside a condition, so error responses carry server stack traces in production. Without them, tRPC adds the stack only when NODE_ENV is not production.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-209"],
+    owasp: [OWASP.misconfiguration],
+  },
   // API Health: Next.js
   "no-nextjs-handlers": {
     analyzer: "API Health",
@@ -294,6 +327,23 @@ export const RULES = {
     cwe: ["CWE-538", "CWE-798"],
     owasp: [OWASP.misconfiguration],
     sensitiveSource: true,
+  },
+  "secret-in-git-history": {
+    analyzer: "Security",
+    title: "Secret in Git history",
+    description:
+      "A commit on the checked-out branch added a credential that is no longer in the current tree, but every clone and fork still contains it. Only scanned with `secretHistory` in .codediag.yml or `--secret-history`: added lines of recent commits are checked for provider formats (private keys, AWS, GitHub, Stripe, Slack, npm, Google, Anthropic, OpenAI, SendGrid, database URLs with a password) and, in configuration and .env files, long random values of secret-like keys. Secrets still in the current tree are left to the other secret rules. Rotate or revoke the credential; rewriting history does not revoke it. Findings never include the value.",
+    defaultSeverity: "critical",
+    cwe: ["CWE-798", "CWE-312"],
+    owasp: [OWASP.authentication],
+    messageIsIdentity: true,
+  },
+  "secret-history-incomplete": {
+    analyzer: "Security",
+    title: "Git history scan incomplete",
+    description:
+      "The Git history scan for removed secrets stopped at its output size or time limit, so older commits were not checked. The findings it reports cover the commits it read.",
+    defaultSeverity: "info",
   },
   "weak-password-hash": {
     analyzer: "Security",

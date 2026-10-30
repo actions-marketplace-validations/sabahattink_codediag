@@ -1,13 +1,20 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
+import { activeIssues } from "./core/issues.js";
 import { getRule } from "./rules/registry.js";
 import {
   type AnalyzerKey,
+  type AnalyzerResult,
   type CodediagConfig,
   DEFAULT_CONFIG,
+  DEFAULT_SECRET_HISTORY_COMMITS,
+  MAX_SECRET_HISTORY_COMMITS,
+  type DiagnosticIssue,
   type RuleSetting,
   type ScoringVersion,
+  type WorkspacePackageSummary,
+  type WorkspaceSummary,
 } from "./types.js";
 
 const ANALYZER_KEYS: AnalyzerKey[] = [
@@ -22,10 +29,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function readThreshold(value: unknown, fallback: number): number {
+function readThreshold<T>(
+  value: unknown,
+  fallback: T,
+  name = "threshold",
+): number | T {
   if (value === undefined) return fallback;
   if (!Number.isInteger(value) || Number(value) < 0 || Number(value) > 100) {
-    throw new Error("threshold must be an integer between 0 and 100");
+    throw new Error(`${name} must be an integer between 0 and 100`);
   }
   return Number(value);
 }
@@ -100,11 +111,57 @@ function readRules(value: unknown): Record<string, RuleSetting> {
   return rules;
 }
 
+/** Severities from least to most severe. */
+const SEVERITIES: Array<DiagnosticIssue["severity"]> = [
+  "info",
+  "warning",
+  "critical",
+];
+
+function readFailOn(value: unknown, name = "failOn"): CodediagConfig["failOn"] {
+  if (value === undefined || value === null) return null;
+  if (!SEVERITIES.includes(value as DiagnosticIssue["severity"])) {
+    throw new Error(`${name} must be critical, warning, or info`);
+  }
+  return value as DiagnosticIssue["severity"];
+}
+
 function readAudit(value: unknown): CodediagConfig["audit"] {
   if (value === undefined) return DEFAULT_CONFIG.audit;
   if (typeof value !== "boolean" && value !== "production")
     throw new Error("audit must be true, false, or production");
   return value;
+}
+
+function isCommitCount(value: unknown): value is number {
+  return (
+    Number.isInteger(value) &&
+    Number(value) >= 1 &&
+    Number(value) <= MAX_SECRET_HISTORY_COMMITS
+  );
+}
+
+function readSecretHistory(value: unknown): CodediagConfig["secretHistory"] {
+  if (value === undefined || value === false) return false;
+  if (value === true) return DEFAULT_SECRET_HISTORY_COMMITS;
+  if (!isCommitCount(value)) {
+    throw new Error(
+      `secretHistory must be true, false, or a number of commits from 1 to ${MAX_SECRET_HISTORY_COMMITS}`,
+    );
+  }
+  return value;
+}
+
+/** `--secret-history` without a value is true; with one, a commit count. */
+export function parseSecretHistory(value: string | true): number {
+  if (value === true) return DEFAULT_SECRET_HISTORY_COMMITS;
+  const count = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!isCommitCount(count)) {
+    throw new Error(
+      `--secret-history must be a number of commits from 1 to ${MAX_SECRET_HISTORY_COMMITS}`,
+    );
+  }
+  return count;
 }
 
 function readAnalyzers(
@@ -140,11 +197,14 @@ export function loadConfig(projectPath: string): CodediagConfig {
   if (!existsSync(configPath)) {
     return {
       threshold: DEFAULT_CONFIG.threshold,
+      packageThreshold: DEFAULT_CONFIG.packageThreshold,
+      failOn: DEFAULT_CONFIG.failOn,
       ignore: [...DEFAULT_CONFIG.ignore],
       maxFileSizeKb: DEFAULT_CONFIG.maxFileSizeKb,
       scoring: { ...DEFAULT_CONFIG.scoring },
       rules: {},
       audit: DEFAULT_CONFIG.audit,
+      secretHistory: DEFAULT_CONFIG.secretHistory,
       analyzers: { ...DEFAULT_CONFIG.analyzers },
     };
   }
@@ -165,11 +225,14 @@ export function loadConfig(projectPath: string): CodediagConfig {
 
   const allowedKeys = new Set([
     "threshold",
+    "packageThreshold",
+    "failOn",
     "ignore",
     "maxFileSizeKb",
     "scoring",
     "rules",
     "audit",
+    "secretHistory",
     "analyzers",
   ]);
   const unknownKeys = Object.keys(document).filter(
@@ -184,6 +247,12 @@ export function loadConfig(projectPath: string): CodediagConfig {
   try {
     return {
       threshold: readThreshold(document.threshold, DEFAULT_CONFIG.threshold),
+      packageThreshold: readThreshold(
+        document.packageThreshold,
+        DEFAULT_CONFIG.packageThreshold,
+        "packageThreshold",
+      ),
+      failOn: readFailOn(document.failOn),
       ignore: readIgnore(document.ignore, DEFAULT_CONFIG.ignore),
       maxFileSizeKb: readMaxFileSizeKb(
         document.maxFileSizeKb,
@@ -192,6 +261,7 @@ export function loadConfig(projectPath: string): CodediagConfig {
       scoring: readScoring(document.scoring, DEFAULT_CONFIG.scoring),
       rules: readRules(document.rules),
       audit: readAudit(document.audit),
+      secretHistory: readSecretHistory(document.secretHistory),
       analyzers: readAnalyzers(document.analyzers, DEFAULT_CONFIG.analyzers),
     };
   } catch (error) {
@@ -212,13 +282,53 @@ export function normalizeIgnorePatterns(entries: string[]): string[] {
   });
 }
 
-export function parseThreshold(value: string): number {
+export function parseThreshold(value: string, name = "threshold"): number {
   if (!/^\d+$/.test(value)) {
-    throw new Error("threshold must be an integer between 0 and 100");
+    throw new Error(`${name} must be an integer between 0 and 100`);
   }
-  return readThreshold(Number(value), DEFAULT_CONFIG.threshold);
+  return readThreshold(Number(value), DEFAULT_CONFIG.threshold, name);
 }
 
 export function isBelowThreshold(score: number, threshold: number): boolean {
   return score < threshold;
+}
+
+export function parseFailOn(value: string): DiagnosticIssue["severity"] {
+  return readFailOn(value, "fail-on") ?? "critical";
+}
+
+/** Active findings that fail a scan with this `failOn` severity. */
+export function findingsAtOrAbove(
+  analyzers: AnalyzerResult[],
+  failOn: CodediagConfig["failOn"],
+): DiagnosticIssue[] {
+  if (failOn === null) return [];
+  const minimum = SEVERITIES.indexOf(failOn);
+  return analyzers
+    .flatMap(activeIssues)
+    .filter((issue) => SEVERITIES.indexOf(issue.severity) >= minimum);
+}
+
+export function failOnMessage(
+  count: number,
+  failOn: DiagnosticIssue["severity"],
+): string {
+  return `${count} active finding${count === 1 ? "" : "s"} at or above ${failOn} severity`;
+}
+
+/** Workspace packages that scored below their package threshold. */
+export function packagesBelowThreshold(
+  workspace: WorkspaceSummary | undefined,
+): WorkspacePackageSummary[] {
+  return (workspace?.packages ?? []).filter(
+    (entry) =>
+      entry.threshold !== undefined &&
+      isBelowThreshold(entry.totalScore, entry.threshold),
+  );
+}
+
+export function packageThresholdMessage(
+  entry: WorkspacePackageSummary,
+): string {
+  return `${entry.path} scored ${entry.totalScore}, below its package threshold ${entry.threshold}`;
 }
