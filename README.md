@@ -51,7 +51,7 @@ codediag auto-detects your stack and runs 5 analyzers. Every finding has a
 stable rule ID ([rule reference](docs/rules.md)), a severity, a location when
 one exists, and a suggested fix.
 
-### API Health `NestJS · Express · Fastify · Next.js`
+### API Health `NestJS · Express · Fastify · Hono · Next.js`
 
 AST analysis (ts-morph, not regex) of the routes your app actually exposes.
 
@@ -68,6 +68,11 @@ AST analysis (ts-morph, not regex) of the routes your app actually exposes.
   through `register()`-ed plugins and `fastify-plugin` encapsulation;
   `onRequest`/`preHandler` auth hooks on the route or its context, body
   schemas on mutating routes, `setErrorHandler`, and health endpoints.
+- **Hono:** routes on `new Hono()` apps, `basePath()`, and sub-apps mounted
+  with `app.route()` across files, replayed in registration order; auth
+  middleware (`jwt()`, `bearerAuth()`, `basicAuth()`, or your own) on the
+  route or an earlier matching `app.use()`; `zValidator` and other body
+  validators; `onError`; and health endpoints.
 - **Next.js:** App Router and Pages Router API handlers, without penalizing
   frontend-only projects.
 
@@ -77,8 +82,10 @@ Hardcoded credentials, `.env` protection in `.gitignore`, Helmet, rate
 limiting, open CORS, weak password hashing, and direct password comparisons.
 Runtime sinks (`eval`, `new Function`, shell commands, raw SQL, disabled TLS
 verification) are found in the AST, and request data is traced through
-variables, destructuring, and reassignments, so `const cmd = req.query.cmd;
-exec(cmd)` is critical. Request data that reaches a file path, an outgoing
+variables, destructuring, reassignments, and up to two calls into your own
+helper functions and services, so `const cmd = req.query.cmd; exec(cmd)` is
+critical, and so is `run(req.query.cmd)` when `run` calls `exec` in another
+file. Request data that reaches a file path, an outgoing
 request's host, a redirect, or an HTML response is reported as path
 traversal, SSRF, an open redirect, or reflected XSS; request data compiled as
 a template or used as an object path is template injection or prototype
@@ -91,7 +98,9 @@ and no report ever contains the value. See
 ### Dependencies
 
 Runs the matching npm, pnpm, Yarn Classic, or Yarn Berry audit (skipped with
-`--no-audit`), checks the lock file and `packageManager` consistency, flags
+`--no-audit`; `audit: production` checks only the dependencies you ship),
+names the affected packages and their advisories in each vulnerability
+finding, checks the lock file and `packageManager` consistency, flags
 deprecated packages, and validates engine specs and essential scripts.
 Monorepo lock files are found up to three parent directories.
 
@@ -155,6 +164,8 @@ codediag scan . --update-baseline .codediag-baseline.json  # Record accepted fin
 codediag scan . --ci --baseline .codediag-baseline.json    # Fail only on new findings
 codediag scan . --compare previous.json   # Score change, new and fixed findings
 codediag scan . --changed-since origin/main  # Only files this branch changes
+codediag scan . --workspaces              # Every monorepo package, combined
+codediag scan . --history .codediag/history  # Record scans, show the trend
 codediag rules                     # List every rule
 codediag explain open-cors         # Explain a rule and how to suppress it
 codediag init                      # Create .codediag.yml
@@ -188,6 +199,37 @@ how many findings elsewhere were left out.
 ```bash
 codediag scan . --changed-since origin/main --threshold 90
 ```
+
+`--history <directory>` keeps a trend: each scan is saved in the directory
+(`codediag-<timestamp>.json`), and the report shows the score over the last
+50 recorded scans, as a sparkline in the terminal and Markdown and as a chart
+with a table view in the HTML report. Commit the directory, or cache it in CI,
+to keep the history.
+
+```bash
+codediag scan . --history .codediag/history
+```
+
+### Monorepos
+
+`--workspaces` scans every package of an npm, pnpm, or Yarn workspace, a
+Lerna repository, or an Nx workspace (Turborepo uses your package manager's
+workspaces). Each package gets its own stack detection and score, using its
+own `.codediag.yml` if it has one and otherwise the root configuration, with
+root `ignore` paths rebased into the package. The combined report lists every
+package and averages each analyzer over the packages it ran in; the total
+uses the usual analyzer weights. Findings are located relative to the root,
+and project-level findings point at the package's `package.json`, so
+baselines, `--compare`, `--changed-since`, SARIF, and the GitHub Action
+(`workspaces: true`) work across the whole repository.
+
+```bash
+codediag scan . --workspaces
+codediag scan . --workspaces --format html > monorepo-report.html
+```
+
+Scanning a workspace root without `--workspaces` scans it as one project and
+suggests the flag.
 
 ### Review-first fix proposals
 
@@ -331,7 +373,7 @@ scoring:
   version: 2
 rules:
   missing-swagger: off   # or info, warning, critical
-audit: true              # false skips the network-based dependency audit
+audit: true              # false skips the network audit; production skips devDependencies
 analyzers:
   api: true
   security: true
@@ -369,6 +411,7 @@ skipped and reported in the JSON `skipped` summary.
 | Next.js | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Express | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Fastify | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Hono | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Node.js | — | ✅ | ✅ | ✅ | ✅ |
 
 ## Where CodeDiag fits
@@ -404,8 +447,12 @@ results in GitHub Code Scanning.
   prototype pollution, and shell spawn rules; secret scanning in
   configuration files and committed `.env` files; `--compare` and
   `--changed-since`; a redesigned HTML report; VS Code quick fixes.
+- **0.7 "Across":** cross-file taint through helpers and services;
+  `--workspaces` for monorepos (CLI, Action, and VS Code); Hono analysis;
+  `--history` score trends; base-branch deltas in pull request comments;
+  audit advisory details and `audit: production`.
 - **Next:** see [docs/roadmap.md](docs/roadmap.md) for planned framework
-  support, cross-file taint, monorepo scoring, and editor improvements.
+  support, deeper taint, Git history secrets, and editor improvements.
 
 ## Contributing
 

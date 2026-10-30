@@ -179,6 +179,40 @@ export const RULES = {
     defaultSeverity: "warning",
     cwe: ["CWE-209"],
   },
+  // API Health: Hono
+  "no-hono-routes": {
+    analyzer: "API Health",
+    title: "No Hono routes",
+    description:
+      "The project depends on Hono but no route registrations with a literal path were detected.",
+    defaultSeverity: "critical",
+    failsAnalyzer: true,
+  },
+  "missing-hono-auth-middleware": {
+    analyzer: "API Health",
+    title: "Mutating Hono route without auth middleware",
+    description:
+      "A POST, PUT, PATCH, or DELETE route has no recognizable authentication middleware (such as jwt(), bearerAuth(), basicAuth(), or a createRoute() middleware) in its own handlers or in an app.use() whose path matches the route and that is registered before it on the same app or on every app that mounts it with app.route(). Hono runs middleware in registration order, so app.use() after the route does not protect it.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "missing-hono-validator": {
+    analyzer: "API Health",
+    title: "Hono route without body validator",
+    description:
+      "A POST, PUT, or PATCH route has no validator for the json or form target (zValidator, vValidator, tbValidator, sValidator, arktypeValidator, or validator() from hono/validator) and no @hono/zod-openapi request body, so the handler reads an unvalidated request body. Validators for param, query, header, or cookie do not count.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
+  "missing-hono-error-handler": {
+    analyzer: "API Health",
+    title: "No Hono error handler",
+    description:
+      "No app.onError() handler was found. Hono's default handler logs the error and replies with a plain-text 500, so clients get a response that does not match the API's error format and errors reach no logger or error tracker beyond the console.",
+    defaultSeverity: "info",
+  },
   // API Health: Next.js
   "no-nextjs-handlers": {
     analyzer: "API Health",
@@ -301,7 +335,7 @@ export const RULES = {
     analyzer: "Security",
     title: "Dynamic shell command",
     description:
-      "A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly or through up to three variable assignments.",
+      "A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep, such as a route passing `req.body.cmd` to `run(cmd)`; findings that depend on such a call have medium confidence.",
     defaultSeverity: "warning",
     cwe: ["CWE-78"],
     owasp: [OWASP.injection],
@@ -310,7 +344,7 @@ export const RULES = {
     analyzer: "Security",
     title: "File path from request data",
     description:
-      "A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Values passed through path.basename() or checked with startsWith() in the same function are not reported.",
+      "A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Request data is also followed into project helper functions and services up to two calls deep (medium confidence). Values passed through path.basename() or checked with startsWith() in the same function are not reported.",
     defaultSeverity: "critical",
     cwe: ["CWE-22"],
     owasp: [OWASP.accessControl],
@@ -364,7 +398,7 @@ export const RULES = {
     analyzer: "Security",
     title: "Dynamically built SQL query",
     description:
-      "A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly or through up to three variable assignments; queries built from request data are reported for any client variable name.",
+      "A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep (medium confidence); queries built from request data are reported for any client variable name.",
     defaultSeverity: "warning",
     cwe: ["CWE-89"],
     owasp: [OWASP.injection],

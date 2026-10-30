@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- Scan monorepo roots package by package and combine the results
+  (`codediag.scanWorkspacePackages`, on by default).
+- Run the CodeDiag 0.7 engine: Hono analysis and audit advisory details.
+
 ## 0.4.0
 
 - Run the CodeDiag 0.6 engine: Fastify analysis, JWT, cookie, template

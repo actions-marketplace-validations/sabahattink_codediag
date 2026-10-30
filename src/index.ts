@@ -6,6 +6,9 @@ import { isBelowThreshold, loadConfig, parseThreshold } from "./config.js";
 import { loadBaseline } from "./core/baseline.js";
 import { changedFilesSince } from "./core/changed-files.js";
 import { compareWithPrevious, loadReport } from "./core/compare.js";
+import { loadHistory, recordHistory, withHistory } from "./core/history.js";
+import { scanWorkspace } from "./core/workspace-scan.js";
+import { detectWorkspaces } from "./core/workspaces.js";
 import { renderHtml } from "./reporters/html.js";
 import { renderAiPrompt, renderFixPlan } from "./reporters/fix-plan.js";
 import { renderJson } from "./reporters/json.js";
@@ -40,7 +43,7 @@ program
   .description(
     chalk.bold("codediag") +
       " \u2014 Diagnose your code before you ship.\n\n" +
-      "  Automated project health scanner for NestJS, Express, Fastify, and Next.js.\n" +
+      "  Automated project health scanner for NestJS, Express, Fastify, Hono, and Next.js.\n" +
       "  https://github.com/sabahattink/codediag",
   )
   .version(getPackageVersion(), "-v, --version");
@@ -78,6 +81,14 @@ program
     "--changed-since <revision>",
     "Report and score only findings in files changed since a Git revision",
   )
+  .option(
+    "--history <directory>",
+    "Record this scan in a directory and show the score trend of the scans recorded there",
+  )
+  .option(
+    "--workspaces",
+    "Scan every workspace package (npm, pnpm, Yarn, Lerna, Nx) and combine the reports",
+  )
   .action(async (path: string, options, command: Command) => {
     const targetPath = resolve(path);
     // --ci implies JSON only when no output format was chosen explicitly.
@@ -104,6 +115,11 @@ program
           "--update-baseline records the whole project and cannot be combined with --changed-since",
         );
       }
+      if (options.changedSince && options.history) {
+        throw new Error(
+          "--history records whole-project scores and cannot be combined with --changed-since",
+        );
+      }
       const baseline = options.baseline
         ? loadBaseline(resolve(options.baseline))
         : undefined;
@@ -116,14 +132,24 @@ program
             files: changedFilesSince(targetPath, options.changedSince),
           }
         : undefined;
-      const scanned = await scan(targetPath, config, {
+      const workspaces = detectWorkspaces(targetPath);
+      if (options.workspaces && !workspaces) {
+        throw new Error(
+          `No workspace packages found in ${targetPath} (package.json workspaces, pnpm-workspace.yaml, lerna.json, or nx.json)`,
+        );
+      }
+      const scanOptions = {
         baseline,
         scope,
         // --no-audit overrides the config; otherwise the config decides.
         audit:
           command.getOptionValueSource("audit") === "cli" ? false : undefined,
-      });
-      const result = previous
+      };
+      const scanned =
+        options.workspaces && workspaces
+          ? await scanWorkspace(targetPath, config, workspaces, scanOptions)
+          : await scan(targetPath, config, scanOptions);
+      const compared = previous
         ? compareWithPrevious(scanned, previous, scope?.files)
         : scanned;
       if (options.updateBaseline) {
@@ -131,9 +157,16 @@ program
         mkdirSync(dirname(baselinePath), { recursive: true });
         writeFileSync(
           baselinePath,
-          `${JSON.stringify(result, null, 2)}\n`,
+          `${JSON.stringify(compared, null, 2)}\n`,
           "utf-8",
         );
+      }
+      let result = compared;
+      if (options.history) {
+        const historyDirectory = resolve(options.history);
+        const earlier = loadHistory(historyDirectory);
+        recordHistory(historyDirectory, compared);
+        result = withHistory(compared, earlier);
       }
 
       switch (format) {
@@ -163,6 +196,14 @@ program
             quiet: options.quiet,
             verbose: options.verbose,
           });
+          if (workspaces && !options.workspaces && !options.quiet) {
+            const count = workspaces.packages.length;
+            console.log(
+              chalk.dim(
+                `  This is a ${workspaces.tool} workspace with ${count} package${count === 1 ? "" : "s"}; add --workspaces to scan each one.\n`,
+              ),
+            );
+          }
           break;
       }
 

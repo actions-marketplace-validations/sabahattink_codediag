@@ -92,6 +92,30 @@ A POST, PUT, PATCH, or DELETE endpoint has no guard on the method or its control
 
 No health, readiness, or liveness route was detected for runtime monitoring and orchestration probes.
 
+### missing-hono-auth-middleware
+
+**Mutating Hono route without auth middleware** · default severity: `warning`
+
+A POST, PUT, PATCH, or DELETE route has no recognizable authentication middleware (such as jwt(), bearerAuth(), basicAuth(), or a createRoute() middleware) in its own handlers or in an app.use() whose path matches the route and that is registered before it on the same app or on every app that mounts it with app.route(). Hono runs middleware in registration order, so app.use() after the route does not protect it.
+
+- CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
+- OWASP Top 10: A07:2021
+
+### missing-hono-error-handler
+
+**No Hono error handler** · default severity: `info`
+
+No app.onError() handler was found. Hono's default handler logs the error and replies with a plain-text 500, so clients get a response that does not match the API's error format and errors reach no logger or error tracker beyond the console.
+
+### missing-hono-validator
+
+**Hono route without body validator** · default severity: `warning`
+
+A POST, PUT, or PATCH route has no validator for the json or form target (zValidator, vValidator, tbValidator, sValidator, arktypeValidator, or validator() from hono/validator) and no @hono/zod-openapi request body, so the handler reads an unvalidated request body. Validators for param, query, header, or cookie do not count.
+
+- CWE: [CWE-20](https://cwe.mitre.org/data/definitions/20.html)
+- OWASP Top 10: A03:2021
+
 ### missing-request-validation
 
 **Handler without request validation** · default severity: `warning`
@@ -161,6 +185,14 @@ The project depends on Fastify but no route registrations with a literal path we
 
 - Scoring: sets the analyzer score to 0 (nothing to evaluate)
 
+### no-hono-routes
+
+**No Hono routes** · default severity: `critical`
+
+The project depends on Hono but no route registrations with a literal path were detected.
+
+- Scoring: sets the analyzer score to 0 (nothing to evaluate)
+
 ### no-nextjs-handlers
 
 **API route files without handlers** · default severity: `critical`
@@ -184,7 +216,7 @@ A .env file tracked by Git contains a provider token or a long, high-entropy val
 
 **Dynamic shell command** · default severity: `warning`
 
-A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly or through up to three variable assignments.
+A shell is invoked through exec or execSync, or through spawn, spawnSync, execFile, or execFileSync with a `shell` option, with a non-literal command or argument. The finding is critical when the command comes from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep, such as a route passing `req.body.cmd` to `run(cmd)`; findings that depend on such a call have medium confidence.
 
 - CWE: [CWE-78](https://cwe.mitre.org/data/definitions/78.html)
 - OWASP Top 10: A03:2021
@@ -193,7 +225,7 @@ A shell is invoked through exec or execSync, or through spawn, spawnSync, execFi
 
 **Dynamically built SQL query** · default severity: `warning`
 
-A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly or through up to three variable assignments; queries built from request data are reported for any client variable name.
+A raw SQL execution method receives a non-literal query. The finding is critical when the query is built from request data, directly, through up to three variable assignments, or through project helper functions up to two calls deep (medium confidence); queries built from request data are reported for any client variable name.
 
 - CWE: [CWE-89](https://cwe.mitre.org/data/definitions/89.html)
 - OWASP Top 10: A03:2021
@@ -301,7 +333,7 @@ A file handles password data and persists records, but no recognizable password 
 
 **File path from request data** · default severity: `critical`
 
-A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Values passed through path.basename() or checked with startsWith() in the same function are not reported.
+A file system call (fs, fs/promises, fs-extra) or res.sendFile()/res.download() without a root option receives a path that comes from request data, so `../` segments can reach files outside the intended directory. Request data is also followed into project helper functions and services up to two calls deep (medium confidence). Values passed through path.basename() or checked with startsWith() in the same function are not reported.
 
 - CWE: [CWE-22](https://cwe.mitre.org/data/definitions/22.html)
 - OWASP Top 10: A01:2021
