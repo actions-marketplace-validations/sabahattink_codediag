@@ -218,6 +218,42 @@ export const RULES = {
       "No app.onError() handler was found. Hono's default handler logs the error and replies with a plain-text 500, so clients get a response that does not match the API's error format and errors reach no logger or error tracker beyond the console.",
     defaultSeverity: "info",
   },
+  // API Health: React Router
+  "no-react-router-routes": {
+    analyzer: "API Health",
+    title: "No React Router route modules",
+    description:
+      "The project depends on React Router framework mode or Remix, but no route modules were found: no root route in the app directory, no app/routes.ts, and no files in the app/routes directory. A route config whose entries cannot be read statically (for example one built by remix-flat-routes) leaves API Health not applicable instead.",
+    defaultSeverity: "critical",
+    failsAnalyzer: true,
+  },
+  "missing-react-router-auth": {
+    analyzer: "API Health",
+    title: "React Router action without auth check",
+    description:
+      "A route module's action, which handles POST, PUT, PATCH, and DELETE requests to its URL, does not reject anonymous requests: it calls no auth check such as requireUserId(request), requireUser(), authenticator.isAuthenticated(request, { failureRedirect }), or a webhook signature check (Stripe constructEvent(), Svix verify()), reads no user from context.get(userContext), does not throw or return a redirect or a 401 or 403 response when the session, user, or a credential such as the Authorization header is missing or wrong (also in project functions it calls, up to two calls deep), and no middleware export of the route or a parent route rejects anonymous requests. clientMiddleware runs in the browser and protects nothing on the server. Actions of sign-in, sign-up, sign-out, and password recovery routes, and actions that create or destroy the user's session, are not reported. clientAction runs in the browser and is not checked. Findings where the request is passed to code this scan cannot follow have medium confidence.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "react-router-loader-auth-only": {
+    analyzer: "API Health",
+    title: "Auth check only in a loader",
+    description:
+      "An action or loader has no auth check of its own and no middleware protects it, but the loader of a parent route (for an action, also of its own route) rejects anonymous requests. That check does not protect it: loaders run in parallel and each can be requested on its own, and a form submission runs the action before any loader. Loaders that return only constants or redirects are not reported, and loader findings have medium confidence because their data may be meant to be public.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "missing-react-router-validation": {
+    analyzer: "API Health",
+    title: "React Router action without input validation",
+    description:
+      "An action reads request.formData() or request.json() and nothing checks the submission: no schema parse (Zod parse or safeParse, zod-form-data, Conform parseWithZod, remix-validated-form validate, Valibot, Yup, or a project function that calls one), no typeof or instanceof check, and no comparison of a form value with a literal, such as an intent. remix-hook-form's getValidatedFormData(request, resolver) reads and validates the body itself.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
   // API Health: tRPC
   "missing-trpc-auth-middleware": {
     analyzer: "API Health",
@@ -279,6 +315,42 @@ export const RULES = {
     description:
       "A Pages Router API route does not branch on request methods, so it accepts every HTTP method.",
     defaultSeverity: "info",
+  },
+  // API Health: SvelteKit
+  "no-sveltekit-endpoints": {
+    analyzer: "API Health",
+    title: "SvelteKit endpoints without handlers",
+    description:
+      "+server files exist but none exports a request handler (GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, QUERY, or fallback), and no +page.server file exports form actions. An app with only pages has no API Health score.",
+    defaultSeverity: "critical",
+    failsAnalyzer: true,
+  },
+  "missing-sveltekit-auth": {
+    analyzer: "API Health",
+    title: "Mutating SvelteKit endpoint without auth check",
+    description:
+      "A POST, PUT, PATCH, or DELETE +server handler, or a form action, is not covered by the handle hook in src/hooks.server.ts (including sequence() parts) rejecting anonymous requests for its path or route id, and does not reject them itself: no check of locals.user, locals.session, locals.auth(), safeGetSession(), the session cookie, or an auth header that returns or throws, no 401 or 403 response, no redirect to sign-in, no webhook signature check, and no project helper up to two calls deep that does so. A hook that only fills event.locals, such as Auth.js's handle, protects nothing. An auth check only in a +layout.server or +page.server load is named in the message: SvelteKit runs form actions before load functions and +server handlers without any layout. Sign-in, sign-up, and sign-out routes and actions, and handlers that pass the request to another router, are not reported.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-306"],
+    owasp: [OWASP.authentication],
+  },
+  "missing-sveltekit-validation": {
+    analyzer: "API Health",
+    title: "SvelteKit request body without validation",
+    description:
+      "A POST, PUT, or PATCH +server handler, or a form action, reads request.json() or request.formData() but neither parses the body with a schema (Zod, Valibot, Yup, Joi, Superforms' superValidate, ArkType, TypeBox, or a project helper up to two calls deep that does) nor answers 400 or 422, for example with fail(400), when a value from the body fails a check.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-20"],
+    owasp: [OWASP.injection],
+  },
+  "sveltekit-csrf-disabled": {
+    analyzer: "API Health",
+    title: "SvelteKit CSRF origin check disabled",
+    description:
+      "svelte.config.js sets kit.csrf.checkOrigin to false, or lists '*' in kit.csrf.trustedOrigins, so SvelteKit accepts form submissions (POST, PUT, PATCH, DELETE with a form content type) from any website, and form actions can be triggered by cross-site requests carrying the user's cookies.",
+    defaultSeverity: "warning",
+    cwe: ["CWE-352"],
+    owasp: [OWASP.accessControl],
   },
   // API Health: shared
   "missing-health-endpoint": {

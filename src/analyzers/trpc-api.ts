@@ -1,8 +1,13 @@
-import { type CallExpression, Node, type SourceFile } from "ts-morph";
+import { type CallExpression, Node } from "ts-morph";
 import type { ScanContext } from "../core/scan-context.js";
 import { fromRule, getRule } from "../rules/registry.js";
 import type { AnalyzerResult, DiagnosticIssue } from "../types.js";
-import { type ModuleIndex, pathAliases } from "./fastify-plugins.js";
+import {
+  type ModuleIndex,
+  moduleIndex,
+  runtimeSources,
+} from "./fastify-plugins.js";
+import { svelteKitAliases } from "./sveltekit-routes.js";
 import { perimeterAuth } from "./trpc-perimeter.js";
 import {
   type Procedure,
@@ -22,9 +27,6 @@ export type ApiAnalyzer = (
   context: ScanContext,
 ) => Promise<AnalyzerResult | null>;
 
-type Sources = ReadonlyArray<{ file: string; sourceFile: SourceFile }>;
-
-const SOURCE_PATTERN = "**/*.{ts,tsx,js,mjs,cjs}";
 const HEALTH_SEGMENT =
   /^(?:health|healthz|healthcheck|live|liveness|ready|readiness)$/i;
 /** Version 1 score shares, as in the other API analyzers. */
@@ -48,35 +50,6 @@ function dependsOnTrpc(context: ScanContext): boolean {
     "@trpc/server" in (context.packageJson?.dependencies ?? {}) ||
     "@trpc/server" in (context.packageJson?.devDependencies ?? {})
   );
-}
-
-function runtimeSources(context: ScanContext): Sources {
-  const sources: Array<{ file: string; sourceFile: SourceFile }> = [];
-  for (const file of context.matchFiles(SOURCE_PATTERN, {
-    exclude: [
-      "**/*.test.{ts,tsx,js,mjs,cjs}",
-      "**/*.spec.{ts,tsx,js,mjs,cjs}",
-      "**/__tests__/**",
-    ],
-  })) {
-    // A malformed source file should not prevent analysis of the rest.
-    const sourceFile = context.getSourceFile(file);
-    if (sourceFile) sources.push({ file, sourceFile });
-  }
-  return sources;
-}
-
-function moduleIndex(context: ScanContext, sources: Sources): ModuleIndex {
-  const typescript = context.typescriptConfig();
-  return {
-    paths: new Map(sources.map(({ file, sourceFile }) => [sourceFile, file])),
-    files: new Map(sources.map(({ file, sourceFile }) => [file, sourceFile])),
-    // T3 apps import their builders through `~/server/api/trpc`.
-    aliases:
-      typescript.status === "ok"
-        ? pathAliases(typescript.options, context.projectPath)
-        : [],
-  };
 }
 
 function isProtected(procedure: Procedure): boolean {
@@ -165,7 +138,11 @@ function plural(count: number, noun: string): string {
 
 function analyzeProcedures(context: ScanContext): TrpcAnalysis {
   const sources = runtimeSources(context);
-  const index = moduleIndex(context, sources);
+  // SvelteKit apps import their builders through `$lib/trpc`.
+  const index: ModuleIndex =
+    context.stack.framework === "sveltekit"
+      ? { ...moduleIndex(context, sources), aliases: svelteKitAliases(context) }
+      : moduleIndex(context, sources);
   const resolver = new TrpcResolver(index);
   const project = resolver.collect(sources);
   const { procedures } = project;

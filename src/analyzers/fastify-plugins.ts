@@ -10,6 +10,7 @@ import {
   type SourceFile,
   SyntaxKind,
 } from "ts-morph";
+import type { ScanContext } from "../core/scan-context.js";
 
 /**
  * Resolves Fastify instances and plugin encapsulation contexts across a
@@ -44,6 +45,8 @@ export type FunctionLike =
   | ArrowFunction
   | FunctionDeclaration
   | FunctionExpression;
+
+type Sources = ReadonlyArray<{ file: string; sourceFile: SourceFile }>;
 
 export interface Instance {
   /** The encapsulation context: a root instance or a plugin function. */
@@ -149,6 +152,15 @@ export function receiverOf(call: CallExpression): Node {
 export function importSource(
   declaration: Node,
 ): { specifier: string; name: string } | null {
+  // export { auth as middleware } from "./auth"
+  if (Node.isExportSpecifier(declaration)) {
+    const specifier = declaration
+      .getExportDeclaration()
+      .getModuleSpecifierValue();
+    return specifier === undefined
+      ? null
+      : { specifier, name: declaration.getName() };
+  }
   if (
     Node.isImportClause(declaration) ||
     Node.isImportSpecifier(declaration) ||
@@ -245,7 +257,7 @@ function importBases(
   });
 }
 
-function resolveImport(
+export function resolveImport(
   index: ModuleIndex,
   from: SourceFile,
   specifier: string,
@@ -261,6 +273,25 @@ function resolveImport(
     ];
     const match = candidates.find((candidate) => index.files.has(candidate));
     if (match) return index.files.get(match);
+  }
+  return undefined;
+}
+
+/** `export const { auth, handlers } = NextAuth(config)`: the element named `name`. */
+function exportedBinding(
+  sourceFile: SourceFile,
+  name: string,
+): Node | undefined {
+  for (const statement of sourceFile.getVariableStatements()) {
+    if (!statement.isExported()) continue;
+    for (const declaration of statement.getDeclarations()) {
+      const pattern = declaration.getNameNode();
+      if (!Node.isObjectBindingPattern(pattern)) continue;
+      const element = pattern
+        .getElements()
+        .find((candidate) => candidate.getName() === name);
+      if (element) return element;
+    }
   }
   return undefined;
 }
@@ -283,17 +314,23 @@ export function exportedValue(
     ? sourceFile.getExportAssignments()[0]?.getExpression()
     : undefined;
   if (assignment) return assignment;
+  // Before getVariableDeclaration(), which also finds the destructuring.
+  const binding = exportedBinding(sourceFile, name);
+  if (binding) return binding;
   const variable = sourceFile.getVariableDeclaration(name);
   if (variable?.isExported()) return variable;
   for (const declaration of sourceFile.getExportDeclarations()) {
-    if (declaration.getModuleSpecifier()) continue;
     const specifier = declaration
       .getNamedExports()
       .find(
         (candidate) =>
           (candidate.getAliasNode()?.getText() ?? candidate.getName()) === name,
       );
-    if (specifier) return specifier.getLocalTargetDeclarations()[0];
+    if (!specifier) continue;
+    // A re-export is followed by definition() like an import.
+    return declaration.getModuleSpecifier()
+      ? specifier
+      : specifier.getLocalTargetDeclarations()[0];
   }
   for (const binary of sourceFile.getDescendantsOfKind(
     SyntaxKind.BinaryExpression,
@@ -326,8 +363,10 @@ export function definition(
     : Node.isIdentifier(value)
       ? value.getSymbol()
       : null;
-  if (symbol === null) return value;
-  const declaration = symbol?.getDeclarations()[0];
+  if (symbol === null && !Node.isExportSpecifier(value)) return value;
+  const declaration = Node.isExportSpecifier(value)
+    ? value
+    : symbol?.getDeclarations()[0];
   const source = declaration ? importSource(declaration) : null;
   if (!declaration || !source) return declaration;
   const target =
@@ -555,4 +594,38 @@ export function createProjectIndex(
     }
   }
   return index;
+}
+
+/** The project's non-test source files, skipping ones that fail to parse. */
+export function runtimeSources(context: ScanContext): Sources {
+  const sources: Array<{ file: string; sourceFile: SourceFile }> = [];
+  for (const file of context.matchFiles("**/*.{ts,tsx,js,mjs,cjs}", {
+    exclude: [
+      "**/*.test.{ts,tsx,js,mjs,cjs}",
+      "**/*.spec.{ts,tsx,js,mjs,cjs}",
+      "**/__tests__/**",
+    ],
+  })) {
+    // A malformed source file should not prevent analysis of the rest.
+    const sourceFile = context.getSourceFile(file);
+    if (sourceFile) sources.push({ file, sourceFile });
+  }
+  return sources;
+}
+
+/** An index of the sources that follows tsconfig `paths` aliases. */
+export function moduleIndex(
+  context: ScanContext,
+  sources: Sources,
+): ModuleIndex {
+  const typescript = context.typescriptConfig();
+  return {
+    paths: new Map(sources.map(({ file, sourceFile }) => [sourceFile, file])),
+    files: new Map(sources.map(({ file, sourceFile }) => [file, sourceFile])),
+    // T3 apps import their builders through `~/server/api/trpc`.
+    aliases:
+      typescript.status === "ok"
+        ? pathAliases(typescript.options, context.projectPath)
+        : [],
+  };
 }

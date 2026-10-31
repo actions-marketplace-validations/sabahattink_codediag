@@ -113,9 +113,11 @@
           "enum": [
             "nestjs",
             "nextjs",
+            "sveltekit",
             "express",
             "fastify",
             "hono",
+            "react-router",
             "trpc",
             "generic",
             "unknown"
@@ -557,9 +559,11 @@
                 "enum": [
                   "nestjs",
                   "nextjs",
+                  "sveltekit",
                   "express",
                   "fastify",
                   "hono",
+                  "react-router",
                   "trpc",
                   "generic",
                   "unknown"
