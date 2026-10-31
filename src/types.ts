@@ -2,9 +2,11 @@ export interface StackInfo {
   framework:
     | "nestjs"
     | "nextjs"
+    | "sveltekit"
     | "express"
     | "fastify"
     | "hono"
+    | "react-router"
     | "trpc"
     | "generic"
     | "unknown";
