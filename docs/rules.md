@@ -29,7 +29,7 @@ A Pages Router API route does not branch on request methods, so it accepts every
 
 **Mutating handler without auth check** · default severity: `warning`
 
-A POST, PUT, PATCH, or DELETE route handler has no recognizable authentication check, and no middleware applies one globally.
+A POST, PUT, PATCH, or DELETE route handler has no recognizable authentication check, and no middleware applies one globally. A handler that verifies a webhook signature, such as Stripe constructEvent(), Svix verify(), or an HMAC compared with timingSafeEqual(), authenticates the sender and is not reported.
 
 - CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
 - OWASP Top 10: A07:2021
@@ -38,7 +38,7 @@ A POST, PUT, PATCH, or DELETE route handler has no recognizable authentication c
 
 **Mutating route without auth hook** · default severity: `warning`
 
-A POST, PUT, PATCH, or DELETE route has no recognizable authentication hook (onRequest, preParsing, preValidation, or preHandler) in its route options, in addHook() calls of its plugin or of fastify-plugin plugins sharing that context, or inherited from every place the plugin is registered.
+A POST, PUT, PATCH, or DELETE route has no recognizable authentication hook (onRequest, preParsing, preValidation, or preHandler) in its route options, in addHook() calls of its plugin or of fastify-plugin plugins sharing that context, or inherited from every place the plugin is registered. A handler that verifies a webhook signature, such as Stripe constructEvent(), Svix verify(), or an HMAC compared with timingSafeEqual(), authenticates the sender and is not reported.
 
 - CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
 - OWASP Top 10: A07:2021
@@ -47,7 +47,7 @@ A POST, PUT, PATCH, or DELETE route has no recognizable authentication hook (onR
 
 **Mutating route without auth middleware** · default severity: `warning`
 
-A POST, PUT, PATCH, or DELETE route has no recognizable authentication or authorization middleware on the route, in earlier pathless router.use() calls, or on every mount that reaches its router.
+A POST, PUT, PATCH, or DELETE route has no recognizable authentication or authorization middleware on the route, in earlier pathless router.use() calls, or on every mount that reaches its router. A handler that verifies a webhook signature, such as Stripe constructEvent(), Svix verify(), or an HMAC compared with timingSafeEqual(), authenticates the sender and is not reported.
 
 - CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
 - OWASP Top 10: A07:2021
@@ -81,7 +81,7 @@ No four-argument Express error handler is registered, so unhandled errors fall b
 
 **Mutating endpoint without auth guard** · default severity: `warning`
 
-A POST, PUT, PATCH, or DELETE endpoint has no guard on the method or its controller (including custom decorators built on UseGuards), no global guard from useGlobalGuards() or APP_GUARD applies, and it is not marked public, so it may be reachable without authentication.
+A POST, PUT, PATCH, or DELETE endpoint has no guard on the method or its controller (including custom decorators built on UseGuards), no global guard from useGlobalGuards() or APP_GUARD applies, and it is not marked public, so it may be reachable without authentication. A handler that verifies a webhook signature, such as Stripe constructEvent(), Svix verify(), or an HMAC compared with timingSafeEqual(), authenticates the sender and is not reported.
 
 - CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
 - OWASP Top 10: A07:2021
@@ -96,7 +96,7 @@ No health, readiness, or liveness route was detected for runtime monitoring and 
 
 **Mutating Hono route without auth middleware** · default severity: `warning`
 
-A POST, PUT, PATCH, or DELETE route has no recognizable authentication middleware (such as jwt(), bearerAuth(), basicAuth(), or a createRoute() middleware) in its own handlers or in an app.use() whose path matches the route and that is registered before it on the same app or on every app that mounts it with app.route(). Hono runs middleware in registration order, so app.use() after the route does not protect it.
+A POST, PUT, PATCH, or DELETE route has no recognizable authentication middleware (such as jwt(), bearerAuth(), basicAuth(), or a createRoute() middleware) in its own handlers or in an app.use() whose path matches the route and that is registered before it on the same app or on every app that mounts it with app.route(). Hono runs middleware in registration order, so app.use() after the route does not protect it. A handler that verifies a webhook signature, such as Stripe constructEvent(), Svix verify(), or an HMAC compared with timingSafeEqual(), authenticates the sender and is not reported.
 
 - CWE: [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
 - OWASP Top 10: A07:2021
@@ -494,6 +494,24 @@ EJS, Pug, Handlebars, Nunjucks, Eta, doT, or lodash compiles or renders a templa
 
 - CWE: [CWE-1336](https://cwe.mitre.org/data/definitions/1336.html), [CWE-94](https://cwe.mitre.org/data/definitions/94.html)
 - OWASP Top 10: A03:2021
+
+### supabase-permissive-policy
+
+**Supabase policy that opens every row** · default severity: `warning`
+
+A row level security policy for UPDATE, DELETE, or ALL whose using expression is `true` lets every role it applies to change every row, and an INSERT or ALL policy for anon or public whose with check expression is `true` lets anyone insert any row. Read-only policies with `using (true)` are not reported, since a public table is often intended, and policies only for service_role are ignored.
+
+- CWE: [CWE-284](https://cwe.mitre.org/data/definitions/284.html)
+- OWASP Top 10: A01:2021
+
+### supabase-table-without-rls
+
+**Supabase table without row level security** · default severity: `critical`
+
+A table created in supabase/migrations, in a schema the Supabase API exposes (public and graphql_public by default, or the schemas under [api] in supabase/config.toml), never gets `alter table … enable row level security`. The anon key ships to the browser, so anyone can read and change every row through the Data API, however well the app's own routes are guarded. Migrations are replayed in file order, following renames, schema moves, drops, and later `disable row level security`. Temporary tables, partitions, and tables whose privileges are revoked with `revoke all` from both anon and authenticated are not reported. Only migration files are read, never the live database.
+
+- CWE: [CWE-862](https://cwe.mitre.org/data/definitions/862.html)
+- OWASP Top 10: A01:2021
 
 ### tls-verification-disabled
 

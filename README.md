@@ -5,8 +5,10 @@
 <h1 align="center">codediag</h1>
 
 <p align="center">
-  <strong>Diagnose your code before you ship.</strong><br>
-  <sub>One command. Five analyzers. One score.</sub>
+  <strong>Which of your API routes can anyone call?</strong><br>
+  <sub>Auth and validation coverage for Next.js, SvelteKit, React Router, Express,
+  Fastify, Hono, NestJS, and tRPC, plus security, dependency, test, and
+  structure checks. One command, no account, runs offline.</sub>
 </p>
 
 <p align="center">
@@ -129,7 +131,10 @@ and no report ever contains the value. With `--secret-history` (or
 `secretHistory` in `.codediag.yml`), the lines recent commits added are also
 searched for credentials that were committed and later deleted, which every
 clone still contains (`secret-in-git-history`); it is off by default because
-results depend on clone depth. See
+results depend on clone depth. In Supabase projects, `supabase/migrations`
+is replayed in order and tables the API exposes without row level security
+are critical (`supabase-table-without-rls`), as are write policies whose
+`using` or `with check` is `true` (`supabase-permissive-policy`). See
 [Security analysis](docs/security-analysis.md).
 
 ### Dependencies
@@ -213,6 +218,7 @@ codediag scan . --secret-history         # Also secrets removed but still in Git
 codediag rules                     # List every rule
 codediag explain open-cors         # Explain a rule and how to suppress it
 codediag init                      # Create .codediag.yml
+codediag mcp                       # Serve MCP on stdio for AI agents
 ```
 
 Generate a repository badge:
@@ -338,6 +344,31 @@ codediag scan . --format sarif > codediag-report.sarif
 See the [SARIF output documentation](docs/sarif-output.md) for the field
 mapping and GitHub Code Scanning workflow. Every rule is described in the
 [rule reference](docs/rules.md).
+
+## Guides
+
+Short, sourced answers to auth checks that look like they protect a route
+but don't:
+
+- [Does an auth check in `+layout.server.ts` protect SvelteKit form actions?](https://sabahattink.github.io/codediag/guides/sveltekit-layout-load-auth.html)
+- [Does a parent loader's auth check protect child routes in React Router?](https://sabahattink.github.io/codediag/guides/react-router-parent-loader-auth.html)
+- [Is your Next.js middleware protecting your API routes?](https://sabahattink.github.io/codediag/guides/nextjs-middleware-api-routes.html)
+
+## AI agents
+
+Let your coding agent answer "which of my routes can anyone call?" with
+CodeDiag's analysis. In Claude Code, install the plugin, which adds a skill
+and the MCP server:
+
+```text
+/plugin install codediag --marketplace sabahattink/codediag
+```
+
+Any other MCP client can start the server with `npx -y @sabahattink/codediag mcp`.
+It offers `find_unprotected_routes`, `scan_project`, and `explain_rule`, and
+stays offline. The [AI agents guide](docs/ai-agents.md) has setup for Claude
+Code, Cursor, VS Code, and Claude Desktop, and the
+[Agent Skill](skills/codediag/SKILL.md) for agents without MCP.
 
 ## CI/CD
 
@@ -489,6 +520,30 @@ replacement for a linter or a full SAST platform. Use it alongside them:
 Everything runs locally from one command, with SARIF output when you want
 results in GitHub Code Scanning.
 
+### What a clean scan does not mean
+
+CodeDiag checks that each route has an auth check and input validation it can
+recognize. A clean result is not a statement that the app is secure:
+
+- **Object-level authorization.** A route can require a session and still let
+  user A read or change user B's record by sending a different ID. CodeDiag
+  does not check that a handler scopes data to the caller; one cross-user test
+  per resource catches what it misses.
+- **Direct database access.** When the browser talks to the database, as with
+  Supabase's anon key or Firebase, row-level security policies or security
+  rules are the boundary, however well the API routes are guarded. CodeDiag
+  reads Supabase migrations for tables without RLS and for write policies open
+  to every row, but it does not judge whether a policy's condition is right,
+  read the live database, or read Firebase rules.
+- **Next.js Server Actions** are not analyzed yet. Check auth inside each one.
+- **Checks it trusts by name.** A helper such as `requireUser()` counts as an
+  auth check; CodeDiag follows project helpers a few calls deep but does not
+  prove that every path through them rejects.
+- **Webhook replay.** A verified signature authenticates the sender; CodeDiag
+  does not check timestamp tolerance or idempotency.
+- **Other runtimes.** Only Node.js backends are analyzed, not Python, Go, Ruby,
+  or Java services.
+
 ## Roadmap
 
 - **0.2:** analyzers for NestJS, Express, and Next.js; validated config; JSON
@@ -520,6 +575,11 @@ results in GitHub Code Scanning.
   in front of Hono and Fastify mounts and in Auth.js middleware; Next.js
   middleware judged per route; one pnpm audit per workspace lock file, split
   by package; fewer password and secret false positives on real apps.
+- **0.11 "Agents":** an MCP server (`codediag mcp`), an Agent Skill, and a
+  Claude Code plugin, so coding agents can find unprotected routes with
+  CodeDiag.
+- **0.12 "Rows":** Supabase tables without row level security and write
+  policies open to every row, read from `supabase/migrations`.
 - **Next:** see [docs/roadmap.md](docs/roadmap.md) for planned framework
   support, editor improvements, and deeper taint tracking.
 
@@ -527,6 +587,11 @@ results in GitHub Code Scanning.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, testing
 expectations, and pull request guidance.
+
+CodeDiag wrong about your code? [Report a false positive or a missed
+finding](https://github.com/sabahattink/codediag/issues/new?template=false_positive.yml)
+with the smallest snippet that shows it. Questions and ideas go to
+[Discussions](https://github.com/sabahattink/codediag/discussions).
 
 ```bash
 git clone https://github.com/sabahattink/codediag.git

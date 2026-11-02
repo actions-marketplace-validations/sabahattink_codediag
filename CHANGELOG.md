@@ -2,6 +2,86 @@
 
 All notable changes to CodeDiag are documented in this file.
 
+## [0.12.0] - 2026-11-02
+
+The "Rows" release: in Supabase apps, where the browser reaches the
+database directly, CodeDiag now checks row level security in your
+migrations.
+
+### Added
+
+- Supabase row level security. CodeDiag replays `supabase/migrations/*.sql`
+  in order and reports, as critical, tables in an exposed schema (`public`
+  and `graphql_public`, or `[api] schemas` in `supabase/config.toml`) whose
+  RLS is never enabled (`supabase-table-without-rls`). Renames, schema moves,
+  drops, `disable row level security`, and `revoke all` from both anon and
+  authenticated are followed. Write policies whose `using` or `with check` is
+  `true` are warnings (`supabase-permissive-policy`). Comments, strings, and
+  function bodies are skipped. Suggested on Indie Hackers; tracked in #53.
+- Suppression comments work in Supabase migration files with SQL `--`
+  comments.
+
+### Changed
+
+- The README says what a clean scan does not mean: object-level
+  authorization, direct database access, Server Actions, auth helpers trusted
+  by name, webhook replay, and non-Node runtimes.
+
+## [0.11.2] - 2026-11-02
+
+### Fixed
+
+- A route that verifies a webhook signature counts as authenticated in
+  Next.js, Express, Fastify, Hono, and NestJS, as it already did in SvelteKit
+  and React Router. Recognized: Stripe `constructEvent()`, Svix `verify()`,
+  an HMAC compared with `timingSafeEqual()`, and helpers or middleware such
+  as `verifyGithubSignature` or `verifySlackSignature`, in the handler or a
+  named handler function. A webhook has no session by design, so these routes
+  were reported as missing auth. Reported on Indie Hackers.
+
+## [0.11.1] - 2026-11-02
+
+### Fixed
+
+- The Claude Code plugin starts `@sabahattink/codediag@latest`. With a bare
+  package name, `npx` ran a copy installed in the project instead, which
+  failed in this repository and could predate the `mcp` command elsewhere.
+  The new plugin version lets Claude Code update installed copies, which it
+  caches by version.
+
+## [0.11.0] - 2026-11-01
+
+The "Agents" release: coding agents can ask CodeDiag which routes anyone can
+call, through an MCP server, an Agent Skill, or a Claude Code plugin.
+
+### Added
+
+- `codediag mcp` serves the Model Context Protocol over stdio with three
+  read-only tools: `find_unprotected_routes` (routes, actions, and procedures
+  without a recognizable auth check or input validation, always offline),
+  `scan_project` (score, analyzer scores, and findings by severity, with an
+  optional audit), and `explain_rule`. Results are structured content with
+  output schemas. The server implements the tools part of MCP for protocol
+  versions 2025-11-25 back to 2024-11-05 without adding a runtime
+  dependency, and a CLI test checks it against the official SDK client.
+- An Agent Skill, `skills/codediag/SKILL.md`, that tells agents when to use
+  CodeDiag, how to run it with or without MCP, where each framework runs
+  auth, and to verify a finding before reporting it. Install it with
+  `npx skills add sabahattink/codediag`.
+- A Claude Code plugin and marketplace in this repository, which add the
+  skill and the MCP server:
+  `/plugin install codediag --marketplace sabahattink/codediag`.
+- MCP Registry metadata: `server.json` and `mcpName`
+  (`io.github.sabahattink/codediag`) in `package.json`.
+- A false-positive issue form, linked from the README, and GitHub
+  Discussions for questions.
+
+### Changed
+
+- The npm description, README, and landing page lead with finding API routes
+  that have no auth check or input validation. The landing page has a large
+  link preview image.
+
 ## [0.10.0] - 2026-10-31
 
 The "Reach" release: SvelteKit and React Router/Remix get API Health
